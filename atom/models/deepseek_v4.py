@@ -3307,8 +3307,10 @@ class MoE(nn.Module):
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
         assert args.n_shared_experts == 1
+        self._comm_fused_moe = get_current_atom_config().moe_backend == "comm_fused"
         self._fuse_shared_into_routed = (
-            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+            not self._comm_fused_moe
+            and is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
                 qc,
                 shared_expert_prefix=f"{prefix}.shared_experts",
                 routed_expert_prefix=f"{prefix}.experts",
@@ -3320,7 +3322,12 @@ class MoE(nn.Module):
                 args.n_shared_experts if self._fuse_shared_into_routed else 0
             ),
         )
-        self.experts = FusedMoE(
+        moe_class = FusedMoE
+        if self._comm_fused_moe:
+            from atom.model_ops.fused_moe.comm_fused_moe import CommFusedMoe
+
+            moe_class = CommFusedMoe
+        self.experts = moe_class(
             num_experts=self.n_routed_experts,
             top_k=self.n_activated_experts,
             hidden_size=self.dim,
@@ -3368,6 +3375,7 @@ class MoE(nn.Module):
             self.shared_experts is not None
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+            and not self._comm_fused_moe
         )
         # Register self in static_forward_context so the custom op dispatcher
         # can look us up by `layer_name` (= self.prefix). Needed by
@@ -3449,7 +3457,9 @@ class MoE(nn.Module):
         return topk_weights, topk_ids
 
     def routed_expert_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        shared_partial: torch.Tensor | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Gate + FusedMoE routed-expert pass.
 
@@ -3459,6 +3469,12 @@ class MoE(nn.Module):
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
+        if self._comm_fused_moe:
+            return self.experts.forward_comm_fused(
+                x,
+                router_logits,
+                shared_partial,
+            )
         return self.experts(hidden_states=x, router_logits=router_logits)
 
     @staticmethod
@@ -3517,9 +3533,13 @@ class MoE(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
+        if self._comm_fused_moe:
+            return self.routed_expert_forward(x, shared_partial=shared)
         routed = self.routed_expert_forward(x)
         return self.combine_outputs(
-            routed, shared, prefix=f"{self.prefix}.combine_outputs"
+            routed,
+            shared,
+            prefix=f"{self.prefix}.combine_outputs",
         )
 
     def dual_stream_moe_forward(
