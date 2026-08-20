@@ -3469,13 +3469,16 @@ class MoE(nn.Module):
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
-        if self._comm_fused_moe:
+        if self._use_comm_fused(x):
             return self.experts.forward_comm_fused(
                 x,
                 router_logits,
                 shared_partial,
             )
         return self.experts(hidden_states=x, router_logits=router_logits)
+
+    def _use_comm_fused(self, x: torch.Tensor) -> bool:
+        return self._comm_fused_moe and self.experts.supports_comm_fused(x.shape[0])
 
     @staticmethod
     def _gather_ids_for_dp(ids: torch.Tensor, ctx) -> torch.Tensor:
@@ -3533,7 +3536,7 @@ class MoE(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
         shared = self.shared_experts(x) if self.shared_experts is not None else None
-        if self._comm_fused_moe:
+        if self._use_comm_fused(x):
             return self.routed_expert_forward(x, shared_partial=shared)
         routed = self.routed_expert_forward(x)
         return self.combine_outputs(

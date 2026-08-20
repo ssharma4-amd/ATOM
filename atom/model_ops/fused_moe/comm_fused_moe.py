@@ -56,6 +56,9 @@ class CommFusedMoe(FusedMoE):
             )
         )
 
+    def supports_comm_fused(self, tokens: int) -> bool:
+        return self._comm_fused_runtime.supports(tokens)
+
     def forward_comm_fused(
         self,
         hidden_states: torch.Tensor,
@@ -69,7 +72,7 @@ class CommFusedMoe(FusedMoE):
             self.layer_name,
         )
 
-    def forward_impl(
+    def forward_comm_fused_impl(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
@@ -128,7 +131,9 @@ def comm_fused_moe_forward(
     layer = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return layer.forward_impl(hidden_states, router_logits, shared_partial)
+    return layer.forward_comm_fused_impl(
+        hidden_states, router_logits, shared_partial
+    )
 
 
 def _comm_fused_moe_forward_fake(
