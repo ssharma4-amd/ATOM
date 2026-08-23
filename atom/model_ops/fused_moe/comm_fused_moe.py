@@ -148,7 +148,7 @@ def _comm_fused_moe_forward_fake(
 direct_register_custom_op(
     op_name="comm_fused_moe_forward",
     op_func=comm_fused_moe_forward,
-    mutates_args=[],
+    mutates_args=["shared_partial"],
     fake_impl=_comm_fused_moe_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
