@@ -3390,7 +3390,6 @@ class MoE(nn.Module):
             self.shared_experts is not None
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
-            and not self._comm_fused_moe
         )
         # Register self in static_forward_context so the custom op dispatcher
         # can look us up by `layer_name` (= self.prefix). Needed by
@@ -3588,6 +3587,8 @@ class MoE(nn.Module):
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
         ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        if self._use_comm_fused(x):
+            return self.single_stream_moe_forward(x)
         if self._use_dual_stream:
             # Shared custom op (also used by V2). Dispatcher reads
             # `_use_dual_stream` + per-call num_tokens vs threshold to pick
