@@ -3307,7 +3307,27 @@ class MoE(nn.Module):
             # attribute mutation across the compile boundary, so stashing on
             # `self.foo` from inside forward is a no-op at runtime.
         assert args.n_shared_experts == 1
-        self._comm_fused_moe = get_current_atom_config().moe_backend == "comm_fused"
+        atom_config = get_current_atom_config()
+        moe_class = FusedMoE
+        self._comm_fused_moe = False
+        layer_quant = qc.get_layer_quant_config(
+            f"{prefix}.experts", check_children=True
+        )
+        if (
+            atom_config.moe_backend == "standard"
+            and not qc.online_quant
+            and layer_quant.quant_dtype == dtypes.fp4x2
+        ):
+            from atom.model_ops.fused_moe.comm_fused_moe import CommFusedMoe
+
+            self._comm_fused_moe = CommFusedMoe.supports_model(
+                model_dim=self.dim,
+                inter_dim=args.moe_inter_dim // self.tp_size,
+                experts=self.n_routed_experts,
+                topk=self.n_activated_experts,
+            )
+            if self._comm_fused_moe:
+                moe_class = CommFusedMoe
         self._fuse_shared_into_routed = (
             not self._comm_fused_moe
             and is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
@@ -3322,11 +3342,6 @@ class MoE(nn.Module):
                 args.n_shared_experts if self._fuse_shared_into_routed else 0
             ),
         )
-        moe_class = FusedMoE
-        if self._comm_fused_moe:
-            from atom.model_ops.fused_moe.comm_fused_moe import CommFusedMoe
-
-            moe_class = CommFusedMoe
         self.experts = moe_class(
             num_experts=self.n_routed_experts,
             top_k=self.n_activated_experts,

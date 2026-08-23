@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
 from atom.config import get_current_atom_config
@@ -14,6 +17,37 @@ from atom.utils.custom_register import direct_register_custom_op
 
 class CommFusedMoe(FusedMoE):
     """FusedMoE weights/routing with Stage2 + TP communication owned by AITer."""
+
+    @staticmethod
+    def supports_model(
+        *, model_dim: int, inter_dim: int, experts: int, topk: int
+    ) -> bool:
+        config = get_current_atom_config()
+        if (
+            os.getenv("AITER_DISABLE_COMM_FUSED_MOE") == "1"
+            or config.enable_expert_parallel
+            or config.parallel_config.data_parallel_size != 1
+            or config.prefill_context_parallel_size != 1
+        ):
+            return False
+
+        from aiter.ops.flydsl.comm_fused_moe_host import ShapeKey, winners_for
+
+        try:
+            return bool(
+                winners_for(
+                    ShapeKey(
+                        get_gfx_runtime(),
+                        model_dim,
+                        inter_dim,
+                        experts,
+                        topk,
+                        int(get_tp_group().world_size),
+                    )
+                )
+            )
+        except KeyError:
+            return False
 
     def _validate_parallel_layout(self) -> None:
         tp_size = int(get_tp_group().world_size)

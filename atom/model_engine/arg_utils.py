@@ -270,10 +270,10 @@ class EngineArgs:
             "--moe-backend",
             type=str,
             default="standard",
-            choices=["standard", "mega", "comm_fused"],
+            choices=["standard", "mega"],
             help="MoE implementation. 'standard' uses the existing "
-            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE; "
-            "'comm_fused' fuses Stage2 with TP communication.",
+            "path and tuned communication-fused kernels when available; "
+            "'mega' uses fused FlyDSL MegaMoE.",
         )
         parser.add_argument(
             "--method",

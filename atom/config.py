@@ -1440,10 +1440,9 @@ class Config:
             self.index_cache_dtype = self.kv_cache_dtype
 
         self.moe_backend = self.moe_backend.strip().lower()
-        if self.moe_backend not in ("standard", "mega", "comm_fused"):
+        if self.moe_backend not in ("standard", "mega"):
             raise ValueError(
-                "moe_backend must be one of "
-                "{'standard', 'mega', 'comm_fused'}, "
+                "moe_backend must be one of {'standard', 'mega'}, "
                 f"got {self.moe_backend!r}"
             )
         if self.moe_backend == "mega" and not self.enable_expert_parallel:
