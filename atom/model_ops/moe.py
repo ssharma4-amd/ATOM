@@ -2786,6 +2786,22 @@ class FusedMoE(torch.nn.Module):
             else:
                 self.expert_mask = (self.expert_map > -1).to(torch.int32)
         if self.expert_layout.mode is SharedExpertMode.LEGACY_AITER:
+            # select_experts sees the rows after the DP all-gather (x dp_size)
+            # and after repeat_rows (x dp_logical_ratio), so sizing this buffer
+            # for the per-rank batch trips its `shape[0] >= tokens_num` assert.
+            # Condition mirrors `use_dp_gather_scatter`; `not use_all2all_kernels`
+            # is redundant under LEGACY_AITER today, kept so it cannot drift.
+            gathers_across_dp = (
+                self.dp_size > 1
+                and not self.moe_parallel_config.use_all2all_kernels
+                and atom_config.enable_dp_attention
+            )
+            gather_factor = self.dp_size if gathers_across_dp else 1
+            gathered_max_num_tokens = (
+                atom_config.max_num_batched_tokens
+                * gather_factor
+                * self.moe_parallel_config.dp_logical_ratio
+            )
             init_aiter_topK_meta_data(
                 n_routed_experts=num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
@@ -2797,7 +2813,7 @@ class FusedMoE(torch.nn.Module):
                     if is_rocm_aiter_fuse_routed_scaling_factor()
                     else 1 / self.routed_scaling_factor
                 ),
-                max_num_tokens=atom_config.max_num_batched_tokens,
+                max_num_tokens=gathered_max_num_tokens,
                 is_EP=self.use_ep,
             )
         assert intermediate_size % self.tp_size == 0
