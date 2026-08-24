@@ -23,6 +23,12 @@ from vllm.v1.attention.backends.utils import (
 # (which reads this unconditionally) to stay on the write slot.
 KimiK3KDAMetadata.non_spec_state_indices_in_tensor = None
 
+# Keyed by (contents, dtype, device) and shared process-wide: each KDA layer
+# group has its own builder, and aiter's single-entry `tensor_cache` thrashes if
+# they hand it one tensor each.
+_NON_SPEC_QSL_BUFFERS: dict[tuple, torch.Tensor] = {}
+_MAX_QSL_BUFFERS = 512
+
 
 class AtomKimiK3KDAMetadataBuilder(KimiK3KDAMetadataBuilder):
     """Adapt vLLM's KDA metadata to ATOM's request-indexed decode kernel."""
@@ -43,7 +49,50 @@ class AtomKimiK3KDAMetadataBuilder(KimiK3KDAMetadataBuilder):
             fast_build=fast_build,
         )
         self._adapt_full_graph_decode_metadata(common_attn_metadata, metadata)
+        self._stabilize_non_spec_query_start_loc(common_attn_metadata, metadata)
         return metadata
+
+    def _stabilize_non_spec_query_start_loc(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        metadata: KimiK3KDAMetadata,
+    ) -> None:
+        """Give ``non_spec_query_start_loc`` a stable identity per contents.
+
+        aiter's chunked KDA path reads ``cu_seqlens`` back to the host
+        (``prepare_chunk_indices``, plus ``_seq_bounds`` on FlashKDA) and leans
+        on ``tensor_cache`` -- which matches on tensor *identity* -- to do it
+        once per forward. Capturing the path is only legal because the warmup
+        for that shape leaves the entry in place, but vLLM rebuilds
+        ``query_start_loc`` every run, so capture arrives with a fresh object,
+        misses, and HIP rejects the host read mid-capture.
+
+        Only speculative decoding gets here: its capture set includes
+        prefill-shaped batches. Plain decode never calls
+        ``chunk_delta_attn_fwd``.
+
+        Keying by contents rather than shape keeps identity and contents
+        one-to-one. A shape key would serve every cudagraph shape the first
+        shape's ``chunk_indices`` -- wrong output rather than a crash.
+        """
+        qsl = metadata.non_spec_query_start_loc
+        if qsl is None:
+            return
+        qsl_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+        if qsl_cpu is None or qsl_cpu.numel() != qsl.numel():
+            # No host mirror to key on; leave it as it came.
+            return
+        key = (qsl_cpu.numpy().tobytes(), qsl.dtype, qsl.device)
+        buf = _NON_SPEC_QSL_BUFFERS.get(key)
+        if buf is None:
+            if len(_NON_SPEC_QSL_BUFFERS) >= _MAX_QSL_BUFFERS:
+                # Serving keys are unbounded; only capture, at startup,
+                # needs the identity.
+                _NON_SPEC_QSL_BUFFERS.clear()
+            buf = torch.empty(qsl.numel(), dtype=qsl.dtype, device=qsl.device)
+            buf.copy_(qsl)
+            _NON_SPEC_QSL_BUFFERS[key] = buf
+        metadata.non_spec_query_start_loc = buf
 
     def _adapt_full_graph_decode_metadata(
         self,
