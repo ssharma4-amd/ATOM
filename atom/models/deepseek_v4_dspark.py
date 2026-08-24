@@ -61,7 +61,7 @@ def _dspark_block_attention_fake(
     positions: torch.Tensor,
     draft_pos: torch.Tensor,
     valid_target: torch.Tensor,
-    topk_idxs: torch.Tensor,
+    topk_idxs: torch.Tensor | None,
     layer_name: str,
 ) -> torch.Tensor:
     return torch.empty_like(x)
@@ -75,7 +75,7 @@ def dspark_block_attention(
     positions: torch.Tensor,  # [B] anchor position per request
     draft_pos: torch.Tensor,  # [B, T] block plan: absolute draft positions
     valid_target: torch.Tensor,  # [B, W] block plan: window validity
-    topk_idxs: torch.Tensor,  # [B, T, W+T] block plan: gather indices
+    topk_idxs: torch.Tensor | None,  # [B,T,W+T] gather idxs; None on fp8
     layer_name: str,
 ) -> torch.Tensor:  # [B, T, dim]
     """Dynamo-opaque wrapper around one DSpark stage's block attention.
@@ -341,15 +341,15 @@ class _DSparkBlockPlan:
     ``forward_spec`` and reused. Recomputing them per stage rebuilt the
     ``[B, T, W+T]`` gather-index block once per stage for identical values.
 
-    ``topk_idxs`` is empty when the fp8 path is planned: that path addresses KV
-    as a CSR list of pool rows and never gathers a materialised
+    ``topk_idxs`` is ``None`` when the fp8 path is planned: that path addresses
+    KV as a CSR list of pool rows and never gathers a materialised
     ``[B, W+T, 512]``, so the block would be built and never read. See
     :func:`_build_block_plan`.
     """
 
     draft_pos: torch.Tensor  # [B, T]      anchor+1 .. anchor+T
     valid_target: torch.Tensor  # [B, W]      rolling-window slot validity
-    topk_idxs: torch.Tensor  # [B, T, W+T] sparse_attn gather indices, or empty
+    topk_idxs: torch.Tensor | None  # [B, T, W+T] gather indices, or None
 
 
 def _build_block_plan(
@@ -389,7 +389,7 @@ def _build_block_plan(
         draft_pos=draft_pos,
         valid_target=valid_target,
         topk_idxs=(
-            valid_target.new_empty(0, dtype=torch.int32)
+            None
             if fp8_planned
             else _dspark_block_topk_idxs(B, T, W, valid_target, device)
         ),
@@ -494,7 +494,6 @@ try:
     from atom.model_ops.linear import ReplicatedLinear
     from atom.model_ops.v4_kernels.dspark_fp8_indices import (
         dspark_build_indices,
-        dspark_index_buffers,
         dspark_index_views,
     )
     from atom.model_ops.v4_kernels.paged_decode import sparse_attn_v4_paged_decode
@@ -795,16 +794,17 @@ class DSparkLayer(Block):  # type: ignore[misc]
 
         fc = get_forward_context()
         W = self.window_size
-        # The asm fp8 path needs the target's 2buff planes, which exist only
-        # under `--kv_cache_dtype fp8` (`deepseek_v4_attn.py:455`), and needs the
-        # pool bound, which warmup precedes. Fall back rather than fail: both
-        # paths are correct and differ in numerics and speed. This is the
-        # runtime form of `dspark_fp8_planned` -- same condition, read off the
-        # layer once the pool has actually bound it.
+        # The runtime form of `dspark_fp8_planned`: the same fact, read off the
+        # pool once it is actually bound (warmup precedes that). Keyed on the
+        # rope plane and nothing else, which is both what the asm kernel
+        # dispatches on (`paged_decode.py:1081`) and the stricter of the two
+        # signals -- `build_kv_cache_tensor` clears the planes on its
+        # early-return branch without clearing `kv_fp8`. Fall back rather than
+        # fail: both paths are correct and differ in numerics and speed.
         slots = draft_rows = batch_ids = kv_indices = kv_indptr = None
         use_fp8 = (
-            getattr(a, "kv_fp8", False)
-            and getattr(a, "unified_kv_rope", None) is not None
+            getattr(a, "unified_kv_rope", None) is not None
+            and getattr(fc.attn_metadata, "dspark_index_buffers", None) is not None
             and not fc.context.is_dummy_run
         )
         if use_fp8:
@@ -829,7 +829,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             # all of them. Stage 0 always runs first and always refills them --
             # `_DSparkInner.forward` walks `self.mtp` in order -- and
             # `dspark_indices_view` raises if it somehow did not.
-            bufs = self.dspark_index_buffers(T, W, x.device)
+            bufs = fc.attn_metadata.dspark_index_buffers
             if self.stage_id == 0:
                 dspark_build_indices(a.swa_window, slots, positions, bufs)
             kv_indices, kv_indptr, draft_rows = dspark_index_views(bufs, B)
@@ -893,7 +893,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             _apply_dspark_kv_qat_(kv, rope_dim)
             kv = kv.view(B, T, a.head_dim)
 
-            if topk_idxs.numel() == 0:
+            if topk_idxs is None:
                 # The plan omits the block when fp8 is PLANNED, but planning
                 # is not taking: warmup (`swa_plane` unbound) and any layer left
                 # without planes land here and still need it. Rebuilt here, not
@@ -1178,29 +1178,6 @@ class DeepseekV4DSpark(DSparkDraftModel):
         return self.model.head_and_sample(normed, hc_hidden, input_ids)
 
 
-class _DSparkIndexBufferOwner:
-    """Lazily allocates the one `DSparkIndexBuffers` the whole backbone shares.
-
-    Sized at `max_num_seqs` and only ever sliced, so there is nothing keyed by
-    shape and nothing reallocated per step. Lazy because the draft width is a
-    forward argument: fixed for the process (`DeepseekV4DSpark.forward_spec`
-    raises if it changes) but not known when the model is built.
-
-    Every stage holds the same owner. That is what lets stage 0 fill the CSR
-    and the rest read it back, and it is why this is one object on the model
-    rather than a buffer per layer.
-    """
-
-    def __init__(self, max_batch: int) -> None:
-        self.max_batch = max_batch
-        self._bufs = None
-
-    def __call__(self, draft: int, window: int, device):
-        if self._bufs is None:
-            self._bufs = dspark_index_buffers(self.max_batch, draft, window, device)
-        return self._bufs
-
-
 @support_torch_compile
 class _DSparkInner(nn.Module):
     """Inner module owning the DSpark backbone layers; embed/head set externally.
@@ -1250,11 +1227,6 @@ class _DSparkInner(nn.Module):
             ]
         )
         self.layers = self.mtp  # alias for reset_kv_cache iteration
-        # One index-buffer owner for the whole backbone: the fp8 path's CSR is
-        # stage-invariant, so stage 0 fills these and the rest read them back.
-        owner = _DSparkIndexBufferOwner(int(atom_config.max_num_seqs))
-        for layer in self.mtp:
-            layer.dspark_index_buffers = owner
         self.embed = None  # set by share_with_target
         self.head = None
 

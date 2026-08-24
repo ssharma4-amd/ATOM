@@ -104,6 +104,10 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
+from atom.model_ops.v4_kernels.dspark_fp8_indices import (
+    DSparkIndexBuffers,
+    dspark_index_buffers,
+)
 from atom.utils import CpuGpuBuffer, upload_numpy
 from atom.utils.forward_context import (
     AttentionMetaData,
@@ -213,6 +217,13 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     # kernel, then gather results back to the ragged layout.
     dspark_ragged_lens_gpu: torch.Tensor | None = None
     dspark_full_q: int = 0
+
+    # DSpark FP8 block attention: the index buffers its draft backbone reads.
+    # One bundle for the whole backbone -- stage 0 fills the CSR and every stage
+    # reads it back -- so it is published here, beside the `state_slot_out` those
+    # same draft layers already take from this object, rather than owned by the
+    # layers. None unless the pool is fp8 and the drafter is DSpark.
+    dspark_index_buffers: DSparkIndexBuffers | None = None
 
     # ----- Per-fwd hoisted (built in `_attach_v4_per_fwd_meta`) -----
     batch_id_per_token: torch.Tensor | None = None
@@ -453,6 +464,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # unchanged. SWA and classical (CSA/HCA Main) share the nope dtype; the
         # rope pool is always bf16.
         self._kv_fp8 = model_runner.kv_cache_dtype == "fp8"
+        self._dspark_index_bufs: DSparkIndexBuffers | None = None
         # aiter prefill (op4) / decode (op5) implement the fp8 (2buff) path only
         # on gfx950 / gfx1250. On any other arch, transparently fall back to a
         # bf16 KV cache instead of hard-failing. Flipping self._kv_fp8 here (before
@@ -2554,6 +2566,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 extend_lens_np, self._dspark_ragged_lens_pad_to(bs)
             )
             attn_metadata.dspark_full_q = int(full_q)
+        if self._kv_fp8 and _drafter is not None and _drafter.is_block_drafter:
+            attn_metadata.dspark_index_buffers = self._dspark_index_buffers(_drafter)
 
         padded_bs = int(bs)
         self._attach_v4_per_fwd_meta(
@@ -4332,6 +4346,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if getattr(cfg.parallel_config, "data_parallel_size", 1) <= 1:
             return None
         return int(bs)
+
+    def _dspark_index_buffers(self, drafter) -> DSparkIndexBuffers:
+        """The DSpark fp8 path's index buffers, allocated once per process.
+
+        Sized at `max_num_seqs` and only ever sliced, like everything else the
+        decode path hands the kernels. Lazy only because the drafter is built
+        after this backend is; the draft width (`min(mtp_k, window_size)`, fixed
+        for the process) is read off it here.
+        """
+        if self._dspark_index_bufs is None:
+            self._dspark_index_bufs = dspark_index_buffers(
+                self.model_runner.config.max_num_seqs,
+                min(int(drafter.mtp_k), self.window_size),
+                self.window_size,
+                self.device,
+            )
+        return self._dspark_index_bufs
 
     def _stage_dspark_ragged_lens(self, extend_lens_np, pad_to: int | None):
         """Pinned async H2D of the per-seq verify lengths, returning the GPU view.
