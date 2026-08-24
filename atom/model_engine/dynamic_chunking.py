@@ -20,20 +20,42 @@ chunk, so it is invariant to ``x`` and invisible to a model fitted only on
 prefix-free prefills - which is what makes an equal-latency solver shrink
 chunks far past the point where the extra chunks pay for themselves.
 
-``gamma`` is therefore what decides whether the feature helps, and it is also
-the coefficient startup profiling gets most wrong: dummy batches carry no real
-cached prefix, so a fit taken from them underestimates ``gamma`` by more than an
-order of magnitude on MLA models and predicts chunk sizes that do not shrink.
-Coefficients fitted from real requests are supplied through
-``--dynamic-chunking-calibration``; see
-``docs/dynamic_chunked_pipeline_parallelism.md`` for how to collect them.
+The coefficients are split across two measurements because no single one can
+identify all four:
+
+* ``b`` comes from startup profiling. ATOM's dummy forwards bypass attention
+  entirely (see the ``is_dummy_run`` early returns in the attention ops), so a
+  dummy chunk sweep measures ``c + b * x`` - the MLP/MoE/projection cost - and
+  nothing else. Per token that is the same arithmetic serving does, which makes
+  the sweep a clean fit for ``b`` and useless for the attention terms.
+* ``a``, ``gamma`` and ``c`` are fitted at runtime by
+  :class:`ChunkLatencyCalibrator` from the residual ``measured - b * x`` of real
+  prefills. The attention terms have to be: dummy forwards never reach them. So
+  does ``c``, because a dummy forward arrives at ``b`` without setting attention
+  up at all - its constant is not the one a real chunk pays, and pinning it makes
+  ``gamma`` absorb the difference.
+
+Telling those three apart needs chunk sizes that vary *independently* of the
+cached prefix, which serving traffic does not supply on its own. At a single
+chunk size the area column is itself affine in the prefix, so the three are not
+merely ill-conditioned but genuinely unidentifiable. Samples taken off a solved
+ladder are no better: there the chunk is a decreasing function of the prefix,
+which leaves ``gamma`` overstated by around 60% and ``a`` understated.
+
+So the scheduler sweeps two widely separated base chunk sizes over the first few
+requests (see ``CALIBRATION_SWEEP_RATIO``), each sweeping a whole prompt, and the
+model is fitted once from those samples and then left alone. ``gamma`` is what
+decides whether the feature helps at all: an equal-latency solver that cannot see
+it shrinks chunks far past the point where the extra chunks pay for themselves.
+Until the fit lands, chunking stays fixed.
 """
 
 from __future__ import annotations
 
 import math
+from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -43,6 +65,51 @@ import numpy as np
 MAX_PREFIX_OVERHEAD_FRACTION = 0.2
 
 MIN_PROFILE_SAMPLES = 8
+
+# Distinct (chunk, prefix) shapes the runtime calibrator needs before it fits.
+# Three unknowns, and a uniform-length workload only offers `prompt / chunk`
+# shapes per base chunk size - four for a 128K prompt swept at 32768 - so a much
+# higher bar would never be met however long the sweep ran.
+MIN_CALIBRATION_SHAPES = 6
+
+# Distinct cached-prefix lengths it needs among them. `a` and `gamma` are both
+# multiplied by something that grows with the prefix, so they only come apart
+# over a spread of prefixes; a single prefix leaves the fit rank deficient.
+MIN_CALIBRATION_PREFIXES = 3
+
+# Distinct chunk sizes it needs among them, which is what the sweep exists to
+# supply. At one chunk size the area column is itself affine in the prefix, so
+# `a`, `gamma` and `c` cannot be told apart at all - fitting anyway recovers a
+# `gamma` around 60% high, and freeing `c` as well puts it orders out.
+MIN_CALIBRATION_CHUNK_SIZES = 2
+
+# Ratio between the two base chunk sizes the sweep alternates between.
+#
+# The sweep is what conditions the fit, and how well is set by how far apart the
+# sizes are: at 4x, the solved chunk ladder lands within about 5% of the one the
+# true coefficients give and stays there across sampling noise, while at 2x the
+# same sweep leaves a tail of fits five times worse than that.
+CALIBRATION_SWEEP_RATIO = 4
+
+# Shapes kept, and timings kept per shape. Chunk sizes repeat heavily once the
+# solver is active, so the shape table stays far below this in practice.
+MAX_CALIBRATION_SHAPES = 512
+MAX_CALIBRATION_TIMINGS_PER_SHAPE = 4
+
+# A fit whose residual is a large fraction of the mean sampled time has not
+# described the workload - co-tenancy, a shifting batch composition or a model
+# whose cost is not attention-dominated - and is not installed.
+MAX_CALIBRATION_RESIDUAL_FRACTION = 0.25
+
+# A full-rank fit can still be too close to singular to survive timing noise.
+# The 4x sweep is around 6 after column scaling; 100 leaves ample headroom while
+# rejecting chunk grids that do not independently excite the fitted terms.
+MAX_CALIBRATION_DESIGN_CONDITION = 100.0
+
+# Bound one-standard-error uncertainty of the fitted latency anywhere in the
+# sampled domain. This measures what the scheduler consumes rather than imposing
+# a relative-error threshold on gamma, which may physically be close to zero.
+MAX_CALIBRATION_PREDICTION_STDERR_FRACTION = 0.05
 
 # Equal-latency chunking only pays off when a chunk gets measurably more
 # expensive as the prefix in front of it grows. A model that predicts the same
@@ -81,17 +148,287 @@ def has_sole_prefill(sources: int, recent_sources: Iterable[int] = ()) -> bool:
     return max((sources, *recent_sources)) < SOLE_PREFILL_THRESHOLD
 
 
-def parse_chunking_calibration(text: str) -> tuple[float, ...]:
-    """Parse ``"a,b,c,gamma"`` (or ``"a,b,c"``) into latency model coefficients."""
+def _scaled_lstsq(design: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Least squares with per-column scaling, returning unscaled coefficients.
+
+    The columns span many orders of magnitude - attention area is O(1e10) next to
+    a constant column of ones - and an unscaled solve reports rank deficiency on
+    data that is perfectly well conditioned once normalized.
+    """
+    scales = np.max(np.abs(design), axis=0)
+    if not np.all(np.isfinite(scales)) or np.any(scales <= 0.0):
+        raise ValueError("Dynamic chunking latency samples have a degenerate column")
     try:
-        coefficients = tuple(float(value) for value in text.split(","))
-    except ValueError as exc:
+        solution, _, rank, _ = np.linalg.lstsq(design / scales, target, rcond=None)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("Failed to fit dynamic chunking latency model") from exc
+    if rank < design.shape[1]:
+        raise ValueError("Dynamic chunking latency samples are rank deficient")
+    return solution / scales
+
+
+def fit_chunk_overhead(
+    chunk_sizes: list[int], latencies_ms: list[float]
+) -> tuple[float, float]:
+    """Fit ``(b, c)`` of ``t(x) = c + b * x`` from a dummy chunk sweep.
+
+    Dummy forwards bypass attention, so this is the whole of what they measure
+    and the two attention coefficients are left to runtime calibration.
+    """
+    if len(chunk_sizes) != len(latencies_ms):
+        raise ValueError("chunk_sizes and latencies_ms must have equal length")
+    if len(chunk_sizes) < MIN_PROFILE_SAMPLES:
         raise ValueError(
-            f"Dynamic chunking calibration must be comma-separated floats, got {text!r}"
-        ) from exc
-    # Reuse the predictor's own validation so a bad fit fails at startup.
-    ChunkSizePredictor.from_coefficients(coefficients)
-    return coefficients
+            f"Dynamic chunking needs at least {MIN_PROFILE_SAMPLES} latency "
+            "profiling samples"
+        )
+
+    chunks = np.asarray(chunk_sizes, dtype=np.float64)
+    latencies = np.asarray(latencies_ms, dtype=np.float64)
+    for name, values in (("chunk_sizes", chunks), ("latencies_ms", latencies)):
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Dynamic chunking {name} must be finite")
+    if np.unique(chunks).size < 2:
+        raise ValueError(
+            "Dynamic chunking needs at least 2 distinct profiling chunk sizes"
+        )
+
+    design = np.column_stack((chunks, np.ones_like(chunks)))
+    linear, constant = (float(value) for value in _scaled_lstsq(design, latencies))
+    if linear <= 0:
+        # A non-positive slope means the sweep never left the plateau where
+        # per-forward overhead dominates. Calibration would then read the whole
+        # chunk cost as attention, so refuse the baseline instead.
+        raise ValueError(
+            "Dynamic chunking requires a positive linear latency coefficient, got "
+            f"b={linear:.3e}; the profiling window is dominated by per-forward "
+            "overhead"
+        )
+    return linear, max(constant, 0.0)
+
+
+@dataclass
+class ChunkLatencyCalibrator:
+    """Fit the attention terms of the chunk latency model from real prefills.
+
+    ``b`` is taken from startup profiling and held fixed; what is fitted here is
+    the part dummy forwards cannot see:
+
+        measured - b * x = a * (2 * L * x + x**2) + gamma * L + c
+
+    Three unknowns and linear in all of them. A request being chunked walks ``L``
+    from 0 to its prompt length, and the scheduler's calibration sweep serves the
+    first few requests at two widely separated chunk sizes, which is what pulls
+    the area term, the per-chunk prefix rebuild and the per-forward overhead
+    apart. One sample at ``L = 0`` anchors ``a``.
+
+    Timings are collected per ``(chunk, prefix)`` shape and reduced by median, so
+    a straggler forward moves the fit far less than it moves any single sample.
+    """
+
+    linear_coeff: float
+    constant_coeff: float
+    _timings: dict[tuple[int, int], deque[float]] = field(default_factory=dict)
+    _since_fit: int = 0
+
+    def add(self, prefix_len: int, chunk_size: int, elapsed_ms: float) -> None:
+        """Record one real prefill forward."""
+        if chunk_size <= 0 or prefix_len < 0 or not math.isfinite(elapsed_ms):
+            return
+        if elapsed_ms <= 0.0:
+            return
+        shape = (int(chunk_size), int(prefix_len))
+        timings = self._timings.get(shape)
+        if timings is None:
+            if len(self._timings) >= MAX_CALIBRATION_SHAPES:
+                return
+            timings = deque(maxlen=MAX_CALIBRATION_TIMINGS_PER_SHAPE)
+            self._timings[shape] = timings
+        timings.append(float(elapsed_ms))
+        # A fresh shape improves conditioning; a repeat refines its median after
+        # an uncertainty rejection. Polling still cannot refit unchanged data.
+        self._since_fit += 1
+
+    @property
+    def num_shapes(self) -> int:
+        return len(self._timings)
+
+    @property
+    def num_prefixes(self) -> int:
+        return len({prefix for _, prefix in self._timings})
+
+    @property
+    def num_chunk_sizes(self) -> int:
+        return len({chunk for chunk, _ in self._timings})
+
+    def _is_due(self) -> bool:
+        if len(self._timings) < MIN_CALIBRATION_SHAPES:
+            return False
+        if len({prefix for _, prefix in self._timings}) < MIN_CALIBRATION_PREFIXES:
+            return False
+        if len({chunk for chunk, _ in self._timings}) < MIN_CALIBRATION_CHUNK_SIZES:
+            return False
+        # A fit is attempted once per timing the last attempt did not see, so a
+        # failure costs one retry per new measurement rather than one per poll.
+        return self._since_fit > 0
+
+    def maybe_fit(self) -> ChunkSizePredictor | None:
+        """Fit if the samples can support one, else ``None``.
+
+        Raises ``ValueError`` when the samples are present but unusable, so the
+        caller can log why calibration is not converging.
+        """
+        if not self._is_due():
+            return None
+        self._since_fit = 0
+        return self.fit()
+
+    def _fit_terms(
+        self, chunks: np.ndarray, prefixes: np.ndarray, latencies: np.ndarray
+    ) -> tuple[float, float, float]:
+        """Solve for ``(a, gamma, c)``, keeping only ``b`` from startup profiling.
+
+        A dummy forward does the same per-token arithmetic serving does, so ``b``
+        is the term it measures honestly. It never sets attention up, though, so
+        its constant is not the one a real chunk pays, and pinning it makes the
+        prefix rebuild absorb the difference - the term the whole feature turns
+        on. ``MIN_CALIBRATION_CHUNK_SIZES`` is what makes fitting it instead
+        possible, so this runs on sweep samples by construction.
+        """
+        areas = 2.0 * prefixes * chunks + chunks * chunks
+        overhead = latencies - self.linear_coeff * chunks
+        ones = np.ones_like(chunks)
+
+        def solve(free_constant: bool, with_prefix: bool) -> tuple[float, float, float]:
+            columns = [areas]
+            if with_prefix:
+                columns.append(prefixes)
+            target = overhead
+            if free_constant:
+                columns.append(ones)
+            else:
+                target = overhead - self.constant_coeff
+            values = [
+                float(value)
+                for value in _scaled_lstsq(np.column_stack(columns), target)
+            ]
+            return (
+                values[0],
+                values[1] if with_prefix else 0.0,
+                values[-1] if free_constant else self.constant_coeff,
+            )
+
+        free_constant = True
+        quadratic, prefix, constant = solve(free_constant, True)
+        if constant < 0.0:
+            # A forward that costs less than nothing to launch is not physical,
+            # and a negative constant drags the terms fitted beside it.
+            free_constant = False
+            quadratic, prefix, constant = solve(free_constant, True)
+        if prefix < 0.0:
+            # Refit rather than clamp: dropping the prefix column leaves the
+            # whole prefix cost in the area term, where a clamp would have left
+            # `a` carrying a negative partner's bias instead.
+            quadratic, prefix, constant = solve(free_constant, False)
+        return quadratic, prefix, constant
+
+    def _validate_fit_quality(
+        self,
+        *,
+        chunks: np.ndarray,
+        prefixes: np.ndarray,
+        latencies: np.ndarray,
+        modeled: np.ndarray,
+        with_prefix: bool,
+    ) -> None:
+        """Reject identifiable but noise-sensitive fits."""
+        areas = 2.0 * prefixes * chunks + chunks * chunks
+        columns = [areas]
+        if with_prefix:
+            columns.append(prefixes)
+        columns.append(np.ones_like(chunks))
+        design = np.column_stack(columns)
+        scales = np.max(np.abs(design), axis=0)
+        scaled = design / scales
+
+        condition = float(np.linalg.cond(scaled))
+        if not math.isfinite(condition) or condition > MAX_CALIBRATION_DESIGN_CONDITION:
+            raise ValueError(
+                "Dynamic chunking calibration design condition is "
+                f"{condition:.1f}, above the "
+                f"{MAX_CALIBRATION_DESIGN_CONDITION:.0f} bound: sampled chunk "
+                "sizes do not separate the latency terms"
+            )
+
+        degrees_of_freedom = len(latencies) - design.shape[1]
+        if degrees_of_freedom <= 0:
+            raise ValueError(
+                "Dynamic chunking calibration has too few samples to estimate "
+                "fit uncertainty"
+            )
+        error = modeled - latencies
+        residual_variance = float(error @ error) / degrees_of_freedom
+        covariance = residual_variance * np.linalg.inv(scaled.T @ scaled)
+        prediction_variance = np.einsum("ij,jk,ik->i", scaled, covariance, scaled)
+        max_stderr = float(np.sqrt(np.maximum(prediction_variance, 0.0)).max())
+        mean = float(np.mean(latencies))
+        uncertainty = max_stderr / mean
+        if uncertainty > MAX_CALIBRATION_PREDICTION_STDERR_FRACTION:
+            raise ValueError(
+                "Dynamic chunking calibration prediction uncertainty is "
+                f"{uncertainty:.1%}, above the "
+                f"{MAX_CALIBRATION_PREDICTION_STDERR_FRACTION:.0%} bound: "
+                "more stable timing samples are required"
+            )
+
+    def fit(self) -> ChunkSizePredictor:
+        shapes = sorted(self._timings)
+        chunks = np.asarray([chunk for chunk, _ in shapes], dtype=np.float64)
+        prefixes = np.asarray([prefix for _, prefix in shapes], dtype=np.float64)
+        latencies = np.asarray(
+            [float(np.median(self._timings[shape])) for shape in shapes],
+            dtype=np.float64,
+        )
+
+        quadratic, prefix, constant = self._fit_terms(chunks, prefixes, latencies)
+        areas = 2.0 * prefixes * chunks + chunks * chunks
+        attention_span = quadratic * float(np.ptp(areas))
+        roundoff = (
+            64.0 * np.finfo(np.float64).eps * max(float(np.max(np.abs(latencies))), 1.0)
+        )
+        if attention_span <= roundoff:
+            raise ValueError(
+                "Dynamic chunking calibration measured no attention growth "
+                f"(a={quadratic:.3e}): chunk cost does not rise with attention "
+                "area, so equal-latency chunking has nothing to equalize"
+            )
+
+        predictor = ChunkSizePredictor(quadratic, self.linear_coeff, constant, prefix)
+        modeled = np.asarray(
+            [
+                predictor.predicted_latency(int(prefix_len), int(chunk))
+                for chunk, prefix_len in shapes
+            ],
+            dtype=np.float64,
+        )
+        error = modeled - latencies
+        rms = float(np.sqrt(np.mean(np.square(error))))
+        mean = float(np.mean(latencies))
+        if rms > MAX_CALIBRATION_RESIDUAL_FRACTION * mean:
+            raise ValueError(
+                f"Dynamic chunking calibration residual is {rms:.1f}ms against a "
+                f"{mean:.1f}ms mean, above the "
+                f"{MAX_CALIBRATION_RESIDUAL_FRACTION:.0%} bound: the samples are "
+                "not described by the chunk latency model"
+            )
+        self._validate_fit_quality(
+            chunks=chunks,
+            prefixes=prefixes,
+            latencies=latencies,
+            modeled=modeled,
+            with_prefix=predictor.prefix_coeff > 0.0,
+        )
+        return predictor
 
 
 @dataclass(frozen=True)
@@ -104,76 +441,9 @@ class ChunkSizePredictor:
     prefix_coeff: float = 0.0
 
     @classmethod
-    def fit(
-        cls,
-        prefix_lens: list[int],
-        chunk_sizes: list[int],
-        latencies_ms: list[float],
-    ) -> "ChunkSizePredictor":
-        """Fit ``t(L, x)`` from startup profiling samples.
-
-        Samples with ``prefix_len > 0`` are what separates ``gamma`` from the
-        attention-area terms; a prefix-free sweep alone leaves ``gamma``
-        unidentifiable and pushes the prefix cost into ``b`` and ``c``.
-        """
-        if not len(prefix_lens) == len(chunk_sizes) == len(latencies_ms):
-            raise ValueError(
-                "prefix_lens, chunk_sizes and latencies_ms must have equal length"
-            )
-        if len(chunk_sizes) < MIN_PROFILE_SAMPLES:
-            raise ValueError(
-                f"Dynamic chunking needs at least {MIN_PROFILE_SAMPLES} latency "
-                "profiling samples"
-            )
-
-        prefixes = np.asarray(prefix_lens, dtype=np.float64)
-        chunks = np.asarray(chunk_sizes, dtype=np.float64)
-        latencies = np.asarray(latencies_ms, dtype=np.float64)
-        for name, values in (
-            ("prefix_lens", prefixes),
-            ("chunk_sizes", chunks),
-            ("latencies_ms", latencies),
-        ):
-            if not np.all(np.isfinite(values)):
-                raise ValueError(f"Dynamic chunking {name} must be finite")
-        if np.unique(chunks).size < 3:
-            raise ValueError(
-                "Dynamic chunking needs at least 3 distinct profiling chunk sizes"
-            )
-
-        area = 2.0 * prefixes * chunks + chunks * chunks
-        design = np.column_stack((area, chunks, np.ones_like(chunks), prefixes))
-        try:
-            coeffs, _, rank, _ = np.linalg.lstsq(design, latencies, rcond=None)
-        except np.linalg.LinAlgError as exc:
-            raise ValueError("Failed to fit dynamic chunking latency model") from exc
-        if rank < design.shape[1]:
-            raise ValueError("Dynamic chunking latency samples are rank deficient")
-
-        quadratic, linear, constant, prefix = (float(value) for value in coeffs)
-        if quadratic <= 0:
-            raise ValueError(
-                "Dynamic chunking requires a positive quadratic latency "
-                f"coefficient, got a={quadratic:.3e}"
-            )
-        if linear <= 0:
-            # Clamping this to 0 (as a prefix-free fit has to) makes the solver
-            # ignore the hardware calibration entirely: the predicted chunk
-            # collapses to sqrt(L^2 + C^2) - L, a pure geometry term. Refusing
-            # the fit keeps fixed-size chunking instead of that fiction.
-            raise ValueError(
-                "Dynamic chunking requires a positive linear latency "
-                f"coefficient, got b={linear:.3e}; the profiling window is "
-                "dominated by per-forward overhead"
-            )
-        # Shape noise can make the prefix term slightly negative. Negative
-        # prefix cost is not physical, and 0 simply disables the floor.
-        return cls(quadratic, linear, constant, max(prefix, 0.0))
-
-    @classmethod
     def from_coefficients(
         cls, coefficients: tuple[float, ...] | list[float]
-    ) -> "ChunkSizePredictor":
+    ) -> ChunkSizePredictor:
         if len(coefficients) not in (3, 4):
             raise ValueError(
                 "Dynamic chunking requires three or four coefficients "
