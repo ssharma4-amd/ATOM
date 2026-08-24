@@ -1,11 +1,11 @@
 import asyncio
 
 from atom.entrypoints.openai.streaming_dispatch import (
-    IncrementalStreamDetokenizer,
     StreamBatchDispatcher,
     StreamOutputCollector,
     merge_chunk,
 )
+from atom.model_engine.stop_strings import IncrementalDetokenizer
 
 
 class _Utf8ByteTokenizer:
@@ -59,7 +59,7 @@ def _resolve(coro):
 
 
 def test_incremental_detokenizer_holds_incomplete_utf8():
-    detokenizer = IncrementalStreamDetokenizer(_Utf8ByteTokenizer())
+    detokenizer = IncrementalDetokenizer(_Utf8ByteTokenizer())
 
     assert detokenizer.update([0xE4], finished=False) == ""
     assert detokenizer.update([0xBD, 0xA0], finished=False) == "你"
