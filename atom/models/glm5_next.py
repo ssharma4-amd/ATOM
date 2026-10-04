@@ -548,9 +548,7 @@ class Glm5NextKDAAttention(KimiKDAAttention):
         assert g.shape == (
             lp,
             self.hidden_size,
-        ), (
-            f"folded KDA gate has shape {tuple(g.shape)}, expected {(lp, self.hidden_size)}"
-        )
+        ), f"folded KDA gate has shape {tuple(g.shape)}, expected {(lp, self.hidden_size)}"
         self.in_proj.weight.data[3 * lp : 4 * lp].copy_(g)
         # Release the factors; they are never used again.
         for m in (self.g_a_proj, self.g_b_proj):

@@ -856,9 +856,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             #     "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
             # )
             assert self.topk_indices_dtype is None
-            assert self.fused_experts is None, (
-                f"Attempt to override experts for {id(self)}!"
-            )
+            assert (
+                self.fused_experts is None
+            ), f"Attempt to override experts for {id(self)}!"
             self.topk_indices_dtype = prepare_finalize.topk_indices_dtype()
             # experts = self.select_gemm_impl(prepare_finalize, layer)
             from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
@@ -2588,9 +2588,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         layer, x, activation
                     )
                 return _moe_result
-            assert fused_shared_experts_scoring_func is None, (
-                "triton kernel does not support fused shared experts func"
-            )
+            assert (
+                fused_shared_experts_scoring_func is None
+            ), "triton kernel does not support fused shared experts func"
 
             if _PROFILE_MOE_ABLATION == "experts":
                 # Match triton_kernel_moe_forward's exact flat top-k primitive,
@@ -2879,9 +2879,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # The dense shared-expert GEMM only implements the SiLU activation
         # path; SwiGLU models have no fused shared experts, so this assert
         # documents the supported scope.
-        assert activation != ActivationType.Swiglu, (
-            "dense shared-expert GEMM only supports the SiLU activation path"
-        )
+        assert (
+            activation != ActivationType.Swiglu
+        ), "dense shared-expert GEMM only supports the SiLU activation path"
 
         M = x.shape[0]
         swiglu_limit = getattr(layer, "swiglu_limit", 0.0)
@@ -5601,7 +5601,9 @@ class FusedMoE(torch.nn.Module):
             loaded_weight = loaded_weight.t().contiguous()
 
         if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
+            raise ValueError(
+                f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
+            )
 
         # Fetch the dim to shard the parameter/loaded weight based on the shard
         # id; `is_transposed` (GPTQ, compressed-tensors) flips it.
