@@ -535,64 +535,6 @@ def test_iq2r_router_dispatch_uses_concrete_runtime_m(monkeypatch, tokens, defer
         assert output is ordinary_output
 
 
-def test_iq2r_expert_ablation_retains_topk_and_skips_experts(monkeypatch):
-    method = object.__new__(moe_mod.Iq2rMoEMethod)
-    method.moe = SimpleNamespace(
-        moe_parallel_config=SimpleNamespace(use_ep=False),
-        max_num_tokens=8,
-    )
-    method.num_experts = 128
-    method.hidden_size = 2
-    method.intermediate_size = 2
-    method._workspaces = {}
-    layer = SimpleNamespace(
-        num_fused_shared_experts=0,
-        routed_scaling_factor=1.0,
-        iq2r_down_metadata=SimpleNamespace(logical_n=2),
-    )
-    hidden = torch.randn(3, 4, dtype=torch.bfloat16)
-    logits = torch.randn(3, 128)
-    topk_weights = torch.tensor(
-        [[0.4, 0.3, 0.2, 0.1], [0.5, 0.2, 0.2, 0.1], [0.6, 0.2, 0.1, 0.1]],
-        dtype=torch.float32,
-    )
-    topk_ids = torch.arange(12, dtype=torch.int32).reshape(3, 4)
-    selections = []
-
-    def fake_select(**kwargs):
-        selections.append(kwargs)
-        return topk_weights, topk_ids
-
-    monkeypatch.setattr(
-        moe_mod.FusedMoE,
-        "select_experts",
-        staticmethod(fake_select),
-    )
-    monkeypatch.setattr(moe_mod, "_PROFILE_MOE_ABLATION", "experts")
-    monkeypatch.setattr(
-        moe_mod,
-        "fused_moe",
-        lambda **_kwargs: pytest.fail("expert kernel must not run in ablation"),
-    )
-
-    output = method.apply(
-        layer=layer,
-        x=hidden,
-        router_logits=logits,
-        top_k=4,
-        renormalize=True,
-        global_num_experts=128,
-        activation=moe_mod.ActivationType.Swiglu,
-    )
-
-    assert len(selections) == 1
-    assert output.shape == (3, 2)
-    assert torch.equal(
-        output,
-        topk_weights[:, :1].to(torch.bfloat16).expand(3, 2),
-    )
-
-
 def _glm53_packed_method(tp_size: int, tp_rank: int, intermediate: int):
     method = object.__new__(moe_mod.Iq2rMoEMethod)
     method.packed = True
@@ -645,15 +587,17 @@ def test_iq2r_glm53_packed_create_weights_at_tp4():
 
     other = torch.nn.Module()
     other.has_bias = False
-    with pytest.raises(NotImplementedError, match="glm53-packed-v1"):
-        with torch.device("meta"):
-            method.create_weights(
-                other,
-                num_experts=288,
-                hidden_size=6144,
-                intermediate_size_per_partition=512,
-                params_dtype=torch.bfloat16,
-            )
+    with (
+        pytest.raises(NotImplementedError, match="glm53-packed-v1"),
+        torch.device("meta"),
+    ):
+        method.create_weights(
+            other,
+            num_experts=288,
+            hidden_size=6144,
+            intermediate_size_per_partition=512,
+            params_dtype=torch.bfloat16,
+        )
 
 
 @pytest.mark.parametrize("tp_size,tp_rank", [(4, 3), (8, 5)])
@@ -672,9 +616,7 @@ def test_iq2r_glm53_packed_loader_slices_the_rank_shard(tp_size, tp_rank):
     generator = torch.Generator().manual_seed(tp_size)
 
     def full(columns):
-        return torch.randint(0, 256, (1, columns), generator=generator).to(
-            torch.uint8
-        )
+        return torch.randint(0, 256, (1, columns), generator=generator).to(torch.uint8)
 
     weights = {
         "w13_weight": full(iq2r_glm53_gate_bytes(4096)),
@@ -729,20 +671,20 @@ def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(monkeypatch):
     monkeypatch.setattr(
         aiter_glm53, "iq2r_glm53_moe_out", lambda *args: calls.append(args)
     )
-    arguments = dict(
-        layer=layer,
-        x=hidden,
-        router_logits=torch.randn(2, 256),
-        top_k=8,
-        renormalize=True,
-        use_grouped_topk=True,
-        topk_group=1,
-        num_expert_group=1,
-        global_num_experts=256,
-        scoring_func="sigmoid",
-        e_score_correction_bias=torch.randn(256),
-        activation=moe_mod.ActivationType.Silu,
-    )
+    arguments = {
+        "layer": layer,
+        "x": hidden,
+        "router_logits": torch.randn(2, 256),
+        "top_k": 8,
+        "renormalize": True,
+        "use_grouped_topk": True,
+        "topk_group": 1,
+        "num_expert_group": 1,
+        "global_num_experts": 256,
+        "scoring_func": "sigmoid",
+        "e_score_correction_bias": torch.randn(256),
+        "activation": moe_mod.ActivationType.Silu,
+    }
 
     output = method.apply(**arguments)
 

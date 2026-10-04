@@ -119,6 +119,15 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_GLM5_FORCE_DENSE_MLA** | bool | 0 (false) | Disable sparse MLA for short-context bring-up comparisons. |
 | **ATOM_GLM5_DISABLE_FUSED_MHC** | bool | 0 (false) | Force the PyTorch mHC reference path instead of AITER's fused kernels. |
 
+### IQ2R routed experts
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_IQ2R_DEFER_ROUTER_BIAS** | bool | 1 (true) | GPT-OSS TP1: for M<=8, pass the router's BF16 bias to AITER's fused IQ2R router front end instead of launching a separate bias add. |
+| **ATOM_IQ2R_FUSE_NEXT_RMSNORM** | bool | 0 (false) | GPT-OSS TP1: fuse the IQ2R route reduce with the next layer's residual-add RMSNorm. |
+| **ATOM_IQ2R_ROUTE_CAPTURE_DIR** | path | unset | Offline kernel tuning: eager IQ2R MoE layers save their top-k routes here (`torch.save`, one file per snapshot). Disables the fused IQ2R router. |
+| **ATOM_IQ2R_ROUTE_CAPTURE_LIMIT** | int | 4 | Snapshots kept per (layer, token count) when `ATOM_IQ2R_ROUTE_CAPTURE_DIR` is set. |
+
 ### MiniMax-M3
 
 | Variable | Type | Default | Description |

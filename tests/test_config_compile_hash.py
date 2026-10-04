@@ -9,19 +9,19 @@ from atom.config import Config
 
 
 def _hash(**overrides):
-    fields = dict(
-        quant_config=None,
-        compilation_config=None,
-        parallel_config=None,
-        tensor_parallel_size=4,
-        prefill_context_parallel_size=1,
-        dcp_config=None,
-        enable_dp_attention=False,
-        index_cache_dtype=None,
-        hf_config=SimpleNamespace(),
-        max_model_len=4096,
-        max_num_seqs=256,
-    )
+    fields = {
+        "quant_config": None,
+        "compilation_config": None,
+        "parallel_config": None,
+        "tensor_parallel_size": 4,
+        "prefill_context_parallel_size": 1,
+        "dcp_config": None,
+        "enable_dp_attention": False,
+        "index_cache_dtype": None,
+        "hf_config": SimpleNamespace(),
+        "max_model_len": 4096,
+        "max_num_seqs": 256,
+    }
     fields.update(overrides)
     return Config.compute_hash(SimpleNamespace(**fields))
 

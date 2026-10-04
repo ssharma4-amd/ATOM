@@ -40,8 +40,6 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    if os.environ.get("HIP_VISIBLE_DEVICES") != "6":
-        raise RuntimeError("GPT-OSS IQ2R qualification requires HIP_VISIBLE_DEVICES=6")
     if args.repetitions < 2:
         raise ValueError("--repetitions must be at least 2")
 
@@ -70,7 +68,7 @@ def main() -> int:
     )
     result = {
         "model": args.model,
-        "hip_visible_devices": os.environ["HIP_VISIBLE_DEVICES"],
+        "hip_visible_devices": os.environ.get("HIP_VISIBLE_DEVICES"),
         "execution": "eager" if args.enforce_eager else "graph",
         "prompt": args.prompt,
         "max_tokens": args.max_tokens,

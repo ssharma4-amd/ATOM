@@ -17,7 +17,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 from typing import Optional
 
 import torch
@@ -57,10 +56,7 @@ from torch import nn
 from transformers import GptOssConfig
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
-_PROFILE_MOE_ABLATION = os.environ.get("ATOM_PROFILE_MOE_ABLATION", "").lower()
-_IQ2R_FUSE_NEXT_RMSNORM = os.environ.get(
-    "ATOM_IQ2R_FUSE_NEXT_RMSNORM", "0"
-).lower() not in ("0", "false", "off")
+_IQ2R_FUSE_NEXT_RMSNORM = envs.ATOM_IQ2R_FUSE_NEXT_RMSNORM
 
 
 def cdiv(x, y):
@@ -240,7 +236,6 @@ class MLPBlock(torch.nn.Module):
             self.moe_hidden_pad = 0
         self.can_fuse_next_rmsnorm = (
             _IQ2R_FUSE_NEXT_RMSNORM
-            and _PROFILE_MOE_ABLATION in ("", "none")
             and self.tp_size == 1
             and getattr(self.experts.quant_method, "supports_fused_next_rmsnorm", False)
         )
@@ -274,12 +269,6 @@ class MLPBlock(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         num_tokens = x.shape[0]
-
-        if _PROFILE_MOE_ABLATION == "all":
-            # Profiling-only whole-MoE ablation. This removes the router,
-            # top-k, dispatch, and expert graph while preserving the model's
-            # logical hidden width and the surrounding production CUDA graph.
-            return x[..., : self.hidden_size] * 0
 
         if self.uses_iq2r_router_frontend:
             if self.router.bias is None:

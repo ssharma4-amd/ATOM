@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import os
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -102,16 +101,10 @@ logger = logging.getLogger("atom")
 _NUM_TBO_UBATCHES = 2
 
 
-_PROFILE_MOE_ABLATION = os.environ.get("ATOM_PROFILE_MOE_ABLATION", "").lower()
-if _PROFILE_MOE_ABLATION not in ("", "none", "experts", "all"):
-    raise ValueError("ATOM_PROFILE_MOE_ABLATION must be one of: none, experts, all")
-
-_IQ2R_ROUTE_CAPTURE_DIR = os.environ.get("ATOM_IQ2R_ROUTE_CAPTURE_DIR", "")
-_IQ2R_ROUTE_CAPTURE_LIMIT = int(os.environ.get("ATOM_IQ2R_ROUTE_CAPTURE_LIMIT", "4"))
+_IQ2R_ROUTE_CAPTURE_DIR = envs.ATOM_IQ2R_ROUTE_CAPTURE_DIR
+_IQ2R_ROUTE_CAPTURE_LIMIT = envs.ATOM_IQ2R_ROUTE_CAPTURE_LIMIT
 _IQ2R_ROUTE_CAPTURE_COUNTS: dict[tuple[str, int], int] = {}
-_IQ2R_DEFER_ROUTER_BIAS = os.environ.get(
-    "ATOM_IQ2R_DEFER_ROUTER_BIAS", "1"
-).lower() not in ("0", "false", "off")
+_IQ2R_DEFER_ROUTER_BIAS = envs.ATOM_IQ2R_DEFER_ROUTER_BIAS
 
 
 def _capture_iq2r_routes(
@@ -140,30 +133,6 @@ def _capture_iq2r_routes(
         },
         output_dir / f"{safe_prefix}-m{topk_ids.shape[0]}-{sequence}.pt",
     )
-
-
-def _routing_anchored_expert_bypass(
-    hidden_states: torch.Tensor,
-    routing_weights: torch.Tensor,
-    *,
-    hidden_size: int | None = None,
-) -> torch.Tensor:
-    """Return a cheap synthetic MoE output that cannot dead-code routing.
-
-    This is a profiling-only surface selected by
-    ``ATOM_PROFILE_MOE_ABLATION=experts``. The output consumes a real top-k
-    weight, so graph compilation must retain router selection while all expert
-    dispatch, quantization, GEMMs, activation, and reduction remain absent.
-    Values are intentionally not meaningful model outputs; only shapes and the
-    production execution graph surrounding MoE are under measurement.
-    """
-
-    output = hidden_states if hidden_size is None else hidden_states[..., :hidden_size]
-    if routing_weights.ndim == 1:
-        routing_anchor = routing_weights[:1]
-    else:
-        routing_anchor = routing_weights[..., :1]
-    return output * 0 + routing_anchor.to(output.dtype)
 
 
 class MoEActivationQuant(Enum):
@@ -1378,9 +1347,9 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
 
         # Decode is launch-bound at M<=16. Let AITER compute top-k, task
         # metadata, and input MXFP8 quantization in one launch. M<=4 uses direct
-        # one-row tasks; M=5..16 preserves expert grouping. Route capture and the
-        # expert-bypass profiler retain the ordinary top-k surface so their
-        # observable routing tensors remain available before MoE runs.
+        # one-row tasks; M=5..16 preserves expert grouping. Route capture
+        # retains the ordinary top-k surface so the captured routing tensors
+        # remain available before MoE runs.
         use_fused_router = (
             x.shape[0] <= 16
             and self.num_experts == 128
@@ -1394,7 +1363,6 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             and fused_shared_experts_scoring_func is None
             and layer.routed_scaling_factor == 1.0
             and not _IQ2R_ROUTE_CAPTURE_DIR
-            and _PROFILE_MOE_ABLATION != "experts"
         )
         if use_fused_router:
             workspace = get_workspace()
@@ -1402,9 +1370,9 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             topk_ids = workspace.topk_ids[: x.shape[0]]
         else:
             # The production M<=8 path can defer the skinny GEMV's separate
-            # BF16 bias launch into AITER's fused router front end. Profiling
-            # and route-capture modes intentionally retain the ordinary top-k
-            # surface, so restore the same BF16-rounded biased logits here.
+            # BF16 bias launch into AITER's fused router front end. Route
+            # capture intentionally retains the ordinary top-k surface, so
+            # restore the same BF16-rounded biased logits here.
             if router_bias is not None:
                 router_logits = router_logits + router_bias
             topk_weights, topk_ids = FusedMoE.select_experts(
@@ -1426,17 +1394,6 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             topk_ids = topk_ids.to(torch.int32).contiguous()
             topk_weights = topk_weights.to(torch.float32).contiguous()
             _capture_iq2r_routes(prefix, topk_ids, topk_weights)
-
-        if _PROFILE_MOE_ABLATION == "experts":
-            if residual is not None:
-                raise RuntimeError(
-                    "IQ2R fused next-layer RMSNorm is unavailable during MoE ablation"
-                )
-            return _routing_anchored_expert_bypass(
-                x,
-                topk_weights,
-                hidden_size=logical_hidden_size,
-            )
 
         if self.packed:
             if residual is not None:
@@ -2591,21 +2548,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             assert (
                 fused_shared_experts_scoring_func is None
             ), "triton kernel does not support fused shared experts func"
-
-            if _PROFILE_MOE_ABLATION == "experts":
-                # Match triton_kernel_moe_forward's exact flat top-k primitive,
-                # but stop before expert sorting and dispatch. This makes the
-                # normal-minus-bypass delta include the entire expert graph on
-                # both IQ2R and A8W4 while keeping router projection and top-k.
-                from aiter.ops.triton.moe.moe_routing.topk import topk as triton_topk
-
-                topk_weights, _topk_ids, _bitmatrix = triton_topk(
-                    router_logits,
-                    top_k,
-                    apply_softmax=renormalize,
-                    HIST_BLOCK_M=32,
-                )
-                return _routing_anchored_expert_bypass(x, topk_weights)
 
             # Takes directly from model dtype in config.json
             return triton_kernel_moe_forward(

@@ -234,6 +234,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE_A4W4": lambda: (
         os.getenv("ATOM_USE_TRITON_MOE_A4W4", "0") == "1"
     ),
+    # IQ2R routed experts (GPT-OSS TP1). For M<=8, hand the router's BF16 bias
+    # to AITER's fused IQ2R router front end instead of a separate bias add.
+    "ATOM_IQ2R_DEFER_ROUTER_BIAS": lambda: (
+        os.getenv("ATOM_IQ2R_DEFER_ROUTER_BIAS", "1").lower()
+        not in ("0", "false", "off")
+    ),
+    # IQ2R routed experts (GPT-OSS TP1). Fuse the route reduce with the next
+    # layer's residual-add RMSNorm. Off by default.
+    "ATOM_IQ2R_FUSE_NEXT_RMSNORM": lambda: (
+        os.getenv("ATOM_IQ2R_FUSE_NEXT_RMSNORM", "0").lower()
+        not in ("0", "false", "off")
+    ),
+    # Offline IQ2R kernel tuning: when set, eager IQ2R MoE layers save their
+    # top-k routes to this directory, at most ATOM_IQ2R_ROUTE_CAPTURE_LIMIT
+    # snapshots per (layer, token count). Disables the fused IQ2R router.
+    "ATOM_IQ2R_ROUTE_CAPTURE_DIR": lambda: os.getenv("ATOM_IQ2R_ROUTE_CAPTURE_DIR", ""),
+    "ATOM_IQ2R_ROUTE_CAPTURE_LIMIT": lambda: int(
+        os.getenv("ATOM_IQ2R_ROUTE_CAPTURE_LIMIT", "4")
+    ),
     # Force DP-attention + EP through the collective fallback even when mori is
     # installed. This is useful for controlled A/B tests and for deployments
     # where the mori shared-memory transport is unavailable or undesirable.
