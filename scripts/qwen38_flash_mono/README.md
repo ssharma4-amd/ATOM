@@ -54,13 +54,19 @@ so we gave the default path the same MXFP4 checkpoint and numerics:
 You need one MI355X. The scripts also need Docker: they pull a pinned `rocm/pytorch` image (ROCm
 10.0, PyTorch 2.13).
 
-**1. The checkpoint**, on CPU, about a minute:
+**1. The checkpoint**, on CPU, from the BF16 model at revision `de4b8e4d`:
 
 ```bash
+hf download Qwen/Qwen3.8-Flash-Next --revision de4b8e4d43b917e7706784d8bb445c9af86a3540 --local-dir Qwen3.8-Flash-Next
 python scripts/qwen38_flash_mxfp4/convert_mxfp4.py --hf Qwen3.8-Flash-Next --out Qwen3.8-Flash-Next-MXFP4
-# or in the container; downloads the pinned BF16 revision unless BF16 points at a copy:
+# or in the container on an MI355X; downloads that revision unless BF16 points at a copy:
 GPU=0 BF16=/path/to/Qwen3.8-Flash-Next bash scripts/qwen38_flash_mono/repro.sh convert
 ```
+
+The [recipe](../../recipes/Qwen3.8-Flash-Next-monokernel.md#the-checkpoint) lists the disk and
+memory it needs and the checksums of the result. The mono path needs this checkpoint. AMD's
+`amd/Qwen3.8-Flash-Next-Quark-MXFP4` is a different one: it keeps the attention and GatedDeltaNet
+projections in BF16.
 
 **2. Serve it.** The mono path is on by default; `ATOM_MONO_ENABLE=0` gives the default path:
 
@@ -73,7 +79,7 @@ python -m atom.entrypoints.openai_server --model Qwen3.8-Flash-Next-MXFP4 --trus
 
 The mono path needs:
 - TP1 and text only (the `--hf-overrides` above);
-- the MXFP4 checkpoint;
+- the converter's MXFP4 checkpoint;
 - the bf16 KV cache with block size 16;
 - `--max-model-len` of at most 262,144 (less the draft count with MTP);
 - `ATOM_ENABLE_REPLAYSSM=0` with MTP.

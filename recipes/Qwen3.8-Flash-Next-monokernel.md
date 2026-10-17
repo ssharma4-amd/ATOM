@@ -13,14 +13,36 @@ model, in BF16 and FP8, is [Qwen3.8-Flash-Next.md](Qwen3.8-Flash-Next.md).
 
 ## The checkpoint
 
-`scripts/qwen38_flash_mxfp4/convert_mxfp4.py` quantizes `Qwen/Qwen3.8-Flash-Next` (BF16, 335 GiB) into
-the MXFP4 checkpoint both paths load (163 GiB). It runs on CPU in about a minute:
+`scripts/qwen38_flash_mxfp4/convert_mxfp4.py` quantizes `Qwen/Qwen3.8-Flash-Next` (BF16, 335 GiB) at
+revision `de4b8e4d` into the MXFP4 checkpoint both paths load (163 GiB). It needs `torch` and
+`safetensors`, and no GPU:
 
 ```bash
+hf download Qwen/Qwen3.8-Flash-Next --revision de4b8e4d43b917e7706784d8bb445c9af86a3540 --local-dir Qwen3.8-Flash-Next
 python scripts/qwen38_flash_mxfp4/convert_mxfp4.py --hf Qwen3.8-Flash-Next --out Qwen3.8-Flash-Next-MXFP4
-# or in the pinned container; downloads revision de4b8e4d unless BF16 points at a copy:
-GPU=0 BF16=/path/to/Qwen3.8-Flash-Next bash scripts/qwen38_flash_mono/repro.sh convert
+cd Qwen3.8-Flash-Next-MXFP4 && sha256sum -c /path/to/ATOM/scripts/qwen38_flash_mxfp4/Qwen3.8-Flash-Next-MXFP4.sha256
 ```
+
+- **Checksums.** The conversion is deterministic. `Qwen3.8-Flash-Next-MXFP4.sha256` lists the 63
+  files of the checkpoint every result below ran on, and a fresh conversion matches all of them.
+- **Disk.** About 500 GiB: the 335 GiB download and the 163 GiB result.
+- **Time and memory.** On a 256-core host with the BF16 files in RAM, it took 41 s and at most
+  53 GiB of memory with the default 16 workers, or 50 s and 13 GiB with `--workers 4`. The
+  converter maps the BF16 files instead of reading them into memory. From disk, reading the
+  335 GiB takes most of the time.
+- **In the container.** `repro.sh convert` runs the same in the pinned container:
+  ```bash
+  GPU=0 BF16=/path/to/Qwen3.8-Flash-Next bash scripts/qwen38_flash_mono/repro.sh convert
+  ```
+  Without `BF16`, it downloads revision `de4b8e4d` into `$WORK/models`. The model repository is
+  public and ungated, so no token is needed. The script sets up its environment first, which needs
+  an MI355X; on other hosts, convert by hand as above.
+- **Not AMD's Quark checkpoint.** `amd/Qwen3.8-Flash-Next-Quark-MXFP4` is a different checkpoint
+  and no result here used it. It has MXFP4 weights only in the decoder layers' experts; the
+  attention, GatedDeltaNet and PLE projections stay BF16, and it declares FP4 activations. The mono
+  path needs this converter's layout. At its first step, it checks every weight's shape and dtype.
+  If one differs, it logs `Qwen3.8 mono decode off: …` and the default path serves. We have not run
+  this branch on the Quark checkpoint.
 
 ## Serving
 
