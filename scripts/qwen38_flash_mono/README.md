@@ -107,6 +107,10 @@ Mean TPOT in ms at one request at a time, with random 1K and 8K prompts and 1,02
 Both paths accept the same number of tokens per step (1.8 / 2.5 / 2.8–2.9 with 1 / 2 / 3 drafts).
 The default path was measured at ATOM `a80c8ada`; later ATOM releases keep improving it.
 
+[recipes/Qwen3.8-Flash-Next-monokernel.md](../../recipes/Qwen3.8-Flash-Next-monokernel.md) has every
+result with the command that reproduces it: single-request speed, serving at 1–4 requests, long
+context and accuracy.
+
 ## Code
 
 | Path | What |
