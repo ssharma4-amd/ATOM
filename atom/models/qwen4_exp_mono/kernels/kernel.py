@@ -22,7 +22,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.qwen4_exp_mono.kernels import buffer_ops as bo
@@ -52,10 +53,17 @@ from atom.models.qwen4_exp_mono.kernels.stages import (
     qsa_group,
     qsa_wide,
 )
+from atom.models.qwen4_exp_mono.kernels.stages.common import task_index
 from atom.models.qwen4_exp_mono.kernels.stages.common_wide import fresh_ids
 from atom.models.qwen4_exp_mono.kernels.stages.delta import b1, b3
 from atom.models.qwen4_exp_mono.kernels.stages.hc import RECORDS as HC_RECORDS
-from atom.models.qwen4_exp_mono.kernels.stages.hc import a1, a2, attn_hc, mlp_hc
+from atom.models.qwen4_exp_mono.kernels.stages.hc import (
+    a1,
+    a1_preload,
+    a2,
+    attn_hc,
+    mlp_hc,
+)
 from atom.models.qwen4_exp_mono.kernels.stages.moe import m3, m4, m5
 from atom.models.qwen4_exp_mono.kernels.stages.out_proj import c1
 from atom.models.qwen4_exp_mono.kernels.stages.ple import ple_mix, ple_proj
@@ -135,6 +143,31 @@ RECORDS = {
     "w_out": DEFAULT.hidden * DEFAULT.delta_value // 2,
     "s_out": DEFAULT.hidden * DEFAULT.delta_value // 32,
 }
+# Kernel head of the builds that start with A1: CTAs with neither an A1 nor
+# an A2 task sleep ``HEAD_SLEEP`` s_sleep units (64 clocks each) first, so that
+# A1's h and w' loads meet less of the other stages' weight streams.
+HEAD_SLEEP = 64
+
+
+def _sleep(n):
+    for _ in range_constexpr(n // 127):
+        rocdl.s_sleep(127)
+    if const_expr(n % 127):
+        rocdl.s_sleep(n % 127)
+
+
+def _head_sleep(c):
+    a1t = task_index(c, "a1") < c.L.tasks["a1"]
+    a2t = task_index(c, "a2") < c.L.tasks["a2"]
+    first = a1t.select(
+        fx.Int32(0), a2t.select(fx.Int32(1), fx.Int32(2))
+    )  # A1, A2, neither
+    if first == 2:
+        _sleep(HEAD_SLEEP)
+
+
+_head_sleep = ASTRewriter.transform(_head_sleep)
+
 ATTN_HALF = ("a1", "a2", "b1", "b3", "c1")
 DELTA_HC = ATTN_HALF + ("m1", "m2")
 DELTA = DELTA_HC + ("m3", "m4", "m5")
@@ -143,7 +176,7 @@ QSA = ORDERS["qsa"]
 STAGES = {"delta": DELTA, "delta_ple": ORDERS["delta_ple"], "qsa": QSA}
 
 
-def _context(kind, step, layer, scratch, lds, experts, rows, seq, group):
+def _context(kind, step, layer, scratch, lds, experts, rows, seq, group, early=False):
     tid = fx.thread_idx.x
     lds_i = lds.w.ptr
     c = SimpleNamespace(
@@ -156,12 +189,15 @@ def _context(kind, step, layer, scratch, lds, experts, rows, seq, group):
         lane=tid % 64,
         wave=uniform(tid // 64),
         bid=fx.block_idx.x,
-        tag=mbx.launch_tag(step, layer),
+        tag=None if early else mbx.launch_tag(step, layer),
+        pre=None,
         lds_i=lds_i,
         lds_f=fx.recast_iter(fx.Float32, lds_i),
         experts=experts,
         scratch=scratch,
     )
+    if early:
+        c.step_word = bo.buffer_load(mbx.rsrc(step), 0, vec_width=1, dtype=T.i32)
     _mailboxes(c, scratch)
     return c
 
@@ -349,6 +385,11 @@ def build_layer(stages=DELTA, experts=DEFAULT.experts, rows=1, seq=False, group=
     )
     lds_words = (for_wide(rows, group) if group else for_rows(rows, seq)).lds_words
     records = dict(RECORDS, h_in=RECORDS["h_in"] * rows)
+    # Narrow builds that start with A1 issue its h and w' loads at the entry,
+    # before the step counter's load is waited on (``a1_preload``).
+    early = stages[0] == "a1" and rows <= MAX_ROWS
+    if early:
+        records["hc_norm_w"] = DEFAULT.hc_width * 2  # a1_preload reads it out of range
     # Every build parameter and the kernels' sources, in FlyDSL's cache key
     # (``atom.mono.plan.build_key``).
     keyed = (
@@ -419,7 +460,7 @@ def build_layer(stages=DELTA, experts=DEFAULT.experts, rows=1, seq=False, group=
         h_out: Int64,
     ):
         lds = fx.SharedAllocator().allocate(Smem).peek()
-        c = _context(kind, step, layer, scratch, lds, experts, rows, seq, group)
+        c = _context(kind, step, layer, scratch, lds, experts, rows, seq, group, early)
         args = (
             ple, h_in, hc_norm_w, w_down, s_down, w_up, s_up, w_inj, w_qkvz, s_qkvz, conv_w, conv_in,
             conv_out, ba_w, a_log, dt_bias, norm_w, rec_in, rec_out, w_qsa, s_qsa, qsa, w_out,
@@ -440,6 +481,12 @@ def build_layer(stages=DELTA, experts=DEFAULT.experts, rows=1, seq=False, group=
                 if name in RAW_ARGS
             },
         )
+        if const_expr(early):
+            c.pre = a1_preload(c, p)
+            rocdl.sched_barrier(0)  # the loads issue before the step word is waited on
+            c.tag = uniform(c.step_word) * mbx.LAYER_SLOTS + layer + 1
+        if const_expr(stages[0] == "a1"):
+            _head_sleep(c)
         if const_expr(rows <= MAX_ROWS and any(s in QSA_STATE for s in stages)):
             if const_expr(group):
                 qsa_group.qsa_len(p, rows, group)

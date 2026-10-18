@@ -10,12 +10,12 @@
 # What is compared: two decode paths in the same ATOM server, on the same MXFP4 checkpoint
 # (repro.sh convert), with the same server line, prompts and client.
 #   DECODE=mono    the monokernel: each decoder layer's decode step is one FlyDSL kernel
-#                  (atom/models/qwen4_exp_mono). Prefill, the embedding, the final mixer and
-#                  lm_head stay ATOM's.
+#                  (atom/models/qwen4_exp_mono). Prefill and the final mixer stay ATOM's;
+#                  the embedding is one launch and lm_head runs from MXFP4 weights.
 #   DECODE=native  the baseline, ATOM's regular path: ATOM's and aiter's own kernels, unchanged
 #                  (aiter's FlyDSL MoE; ATOM's Triton W4A8 GEMM, GatedDeltaNet and QSA kernels).
-#                  The only ATOM changes it runs are the few lines that load this checkpoint
-#                  and the inline-send option below.
+#                  The ATOM changes it runs are the few lines that load this checkpoint, the
+#                  inline-send option below and the step-overhead changes README.md lists.
 # Both run with ATOM_RUNNER_INLINE_SEND=1, and with ATOM_ENABLE_REPLAYSSM=0 when MTP is on (the
 # mono's verify needs it off; ATOM's own default turns it on with MTP).
 #
@@ -317,7 +317,7 @@ new_run() {
   {
     echo "command: $1"
     if [ "$DECODE" = mono ]; then
-      echo "path: mono, the monokernel decode (prefill, embedding and lm_head stay ATOM's)"
+      echo "path: mono, the monokernel decode (prefill and the final mixer stay ATOM's)"
     else
       echo "path: native, ATOM's regular path, the baseline (ATOM's and aiter's own kernels)"
     fi

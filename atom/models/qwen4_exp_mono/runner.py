@@ -50,6 +50,8 @@ from .kernels.layout import scratch_bytes
 from .kernels.stages import ple as ple_stage
 from .kernels.stages import qsa as qsa_stage
 from .kernels.stages.common import DELTA_STATE
+from .prologue import StepPrologue
+from .prologue import refusal as prologue_refusal
 from .state import QSA_CACHES as CACHE_PAGES
 from .state import bind_state
 from .step_meta import (
@@ -135,6 +137,13 @@ class Qwen4MonoDecodeRunner:
         self.ple = layers[self.ple_layer].ple
         if self.ple is None:
             raise MonoUnsupported(f"layer {self.ple_layer} has no PLE")
+        # steps 1 and 2 in one launch, else ATOM's ops
+        why = prologue_refusal(self.embed_tokens, self.ple.ple_embedding, g.hc_width)
+        self.prologue = None
+        if why is None:
+            self.prologue = StepPrologue(self.embed_tokens, self.ple.ple_embedding)
+        else:
+            logger.info("Qwen3.8 mono decode: steps 1 and 2 op for op: %s", why)
         self.bound = [
             W.bind_layer(layers[i], i, self.kinds[i], g.experts)
             for i in range(g.layers)
@@ -265,13 +274,16 @@ class Qwen4MonoDecodeRunner:
     # ------------------------------------------------------------ forward
     def embed(self, ids: torch.Tensor, w: Width) -> None:
         """Steps 1 and 2: ``w.h0`` and ``w.emb`` for tokens ``ids``."""
+        md = get_forward_context().attn_metadata.ple_metadata
+        if self.prologue is not None:
+            self.prologue(ids, md, w.h0, w.emb)
+            return
         g = self.geometry
         rows = w.rows
         e = self.embed_tokens(ids)
         w.h0.view(rows, g.hc_count, g.hidden).copy_(
             e.unsqueeze(1).expand(-1, g.hc_count, -1)
         )
-        md = get_forward_context().attn_metadata.ple_metadata
         embedding = self.ple.ple_embedding
         context = advance_ngram_state(
             ids,

@@ -40,6 +40,7 @@ from atom.models.qwen4_exp_mono.kernels.stages.hc import (
     norm_inv,
     norm_load,
     norm_sums,
+    poll_inv,
     sigmoid_acc,
 )
 
@@ -117,14 +118,15 @@ def a2(c, hc):
         su = fx.Int32(bo.buffer_load(hc.s_up, nb * 64 + lane, vec_width=1, dtype=T.i32))
         ww = fx.Int32(bo.buffer_load(hc.norm_w, idx // 2, vec_width=1, dtype=T.i32))
         if const_expr(hc.polled):
-            pre_poll_wide(c1_hint, hc.producers * rows, c.tag)
-            hws = [
-                v[0]
-                for v in mbx.poll(
-                    [(hc.h, mb_ix(idx // 2, r), 1) for r in range(rows)], c.tag
-                )
-            ]
-            halves_sums(c, hc)
+            if const_expr(not hc.wide_inv):
+                pre_poll_wide(c1_hint, hc.producers * rows, c.tag)
+                hws = [
+                    v[0]
+                    for v in mbx.poll(
+                        [(hc.h, mb_ix(idx // 2, r), 1) for r in range(rows)], c.tag
+                    )
+                ]
+                halves_sums(c, hc)
         else:
             hws = [
                 fx.Int32(
@@ -134,12 +136,23 @@ def a2(c, hc):
                 )
                 for r in range(rows)
             ]
-            for r in range_constexpr(rows):
-                norm_sums(c, hc, norm_load(hc.h, tid, r), r)
-        norm_inv(c, hc)
+            if const_expr(not hc.wide_inv):
+                for r in range_constexpr(rows):
+                    norm_sums(c, hc, norm_load(hc.h, tid, r), r)
+        if const_expr(not hc.wide_inv):
+            norm_inv(c, hc)
 
-        # The low-rank pack: 80 fp8 words then zeros to 96, 10 exponents then 127.
+        # The low-rank pack: 80 fp8 words then zeros to 96, 10 exponents then
+        # 127; from INV_ROWS rows the streams' inverse RMS (A1's task 0 of each row).
         pre_poll_wide(hint, DOWN_GROUPS * rows, c.tag)
+        if const_expr(hc.polled and hc.wide_inv):
+            # A1's tasks of a row polled all its streams before publishing.
+            hws = [
+                v[0]
+                for v in mbx.poll(
+                    [(hc.h, mb_ix(idx // 2, r), 1) for r in range(rows)], c.tag
+                )
+            ]
         if tid < C.hc_lowrank // 8:
             vs = mbx.poll([(hc.lr8, mb_ix(tid * 2, r), 2) for r in range(rows)], c.tag)
             for r in range_constexpr(rows):
@@ -161,6 +174,8 @@ def a2(c, hc):
                 fx.ptr_store(
                     fx.Int32(p2.SCALE_ONE), le + row_ix(tid - 192 + DOWN_GROUPS, r, sle)
                 )
+        if const_expr(hc.wide_inv):
+            poll_inv(c, hc)
         gpu.barrier()
 
         xl8, xle = mfma_operands(c, l8, le, "l8", "le")

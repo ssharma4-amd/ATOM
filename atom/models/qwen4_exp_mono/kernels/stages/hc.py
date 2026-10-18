@@ -16,14 +16,18 @@ A2, task ``t`` (80): columns ``32 t .. 32 t + 31`` of every stream. Wave ``w``
 runs the up chain of n-block ``2 t + 160 (w // 2) + w % 2`` over k_iters 0-2,
 then the read epilogue; wave 0 averages the streams and publishes the mixed
 row's fp8 words, bf16 words and exponent. A2 only needs the norm's
-statistics, so it reads its own 128 values of ``h`` and ``w'``.
+statistics, so it reads its own 128 values of ``h`` and ``w'``. From
+``INV_ROWS`` request rows A1's task 0 of each row hands A2 the 4 streams'
+inverse RMS (``inv`` mailbox) instead: rebuilding every row's statistics costs
+A2 more than the hand-off there (and less up to 9 rows).
 
 Both HCs run this code on a descriptor (:func:`attn_hc`, :func:`mlp_hc`): stage
 names, weights, mailboxes, and where the streams come from. The attention HC
 reads the layer input from memory. The MLP HC's streams are C1's output: M1
 polls them from the ``w`` mailbox, and M2 builds the chunk square sums from
 C1's 16-column sums (``whs``, the same tree as the norm's chunk sums) instead
-of polling all the streams.
+of polling all the streams. From ``INV_ROWS`` rows M2 polls M1's inverse RMS
+(``minv``) and its own words of the streams.
 
 Batched builds (``c.rows`` request rows) run every row's arithmetic exactly as
 one request's. A1 runs every request row's one-request tasks, on that row's
@@ -66,6 +70,7 @@ from atom.models.qwen4_exp_mono.kernels.stages.common import (
     lds_row,
     mb_ix,
     mfma_operands,
+    payload_wait,
     row_ix,
     task_index,
 )
@@ -99,6 +104,8 @@ RECORDS = {
 OOB = 1 << 28
 UP_KI = 3  # of 4 stored k_iters; the 4th is all zero
 UP_NB = 2 * C.hidden // 32  # n-blocks per stream: 160
+INV_ROWS = 12  # A1 -> A2 and M1 -> M2 hand the inverse RMS over from this many rows
+INV_TID = 256  # A2 from INV_ROWS rows: first of the threads polling the inverse RMS
 C1_TILES = TASKS["c1"]  # producers of the MLP HC's streams
 
 
@@ -112,7 +119,7 @@ def attn_hc(c, p):
     else:
         src = dict(polled=False, h=p.h_in, hs=None, producers=0, hint_stride=0)
     return SimpleNamespace(
-        down="a1", up="a2", **src,
+        down="a1", up="a2", **src, wide_inv=c.rows >= INV_ROWS, inv=c.mb_inv,
         norm_w=p.hc_norm_w, w_down=p.w_down, s_down=p.s_down, w_up=p.w_up, s_up=p.s_up, w_inj=p.w_inj,
         lr8=c.mb_lr8, lre=c.mb_lre, inj=c.mb_inj, x8=c.mb_x8, xe=c.mb_xe, xbf=c.mb_xbf,
     )  # fmt: skip
@@ -121,6 +128,7 @@ def attn_hc(c, p):
 def mlp_hc(c, p):
     return SimpleNamespace(
         down="m1", up="m2", polled=True, h=c.mb_w, hs=c.mb_whs, producers=C1_TILES, hint_stride=1,
+        wide_inv=c.rows >= INV_ROWS, inv=c.mb_minv,
         norm_w=p.m_norm_w, w_down=p.m_w_down, s_down=p.m_s_down, w_up=p.m_w_up, s_up=p.m_s_up, w_inj=p.m_w_inj,
         lr8=c.mb_mlr8, lre=c.mb_mlre, inj=c.mb_minj, x8=c.mb_mx8, xe=c.mb_mxe, xbf=c.mb_mxbf,
     )  # fmt: skip
@@ -270,6 +278,32 @@ def norm_inv(c, hc):
 
 
 norm_inv = ASTRewriter.transform(norm_inv)
+
+
+def put_inv(c, hc, t, rr):
+    """From ``INV_ROWS`` rows, A1's task 0 of request row ``rr``: the row's
+    inverse RMS (LDS ``inv``) for A2, which then reads only its own words."""
+    tid = c.tid
+    if (t == 0) & (tid < C.hc_count):
+        mbx.put(
+            hc.inv, mb_ix(tid, rr), fx.ptr_load(c.lds_f + (c.L.lds["inv"] + tid)), c.tag
+        )
+
+
+put_inv = ASTRewriter.transform(put_inv)
+
+
+def poll_inv(c, hc):
+    """From ``INV_ROWS`` rows, A2: every row's inverse RMS (:func:`put_inv`) into
+    LDS ``inv``, one value per thread from ``INV_TID``."""
+    tid = c.tid
+    if (tid >= INV_TID) & (tid < INV_TID + C.hc_count * c.rows):
+        b, r = (tid - INV_TID) % C.hc_count, (tid - INV_TID) // C.hc_count
+        (v,) = mbx.poll([(hc.inv, mb_ix(b, r), 1)], c.tag)
+        fx.ptr_store(v[0], c.lds_i + row_ix(c.L.lds["inv"] + b, r, c.L.stride["inv"]))
+
+
+poll_inv = ASTRewriter.transform(poll_inv)
 
 
 def norm_values(c, h, w, r, row=0):
@@ -488,20 +522,25 @@ def _a1_task(c, hc, t, rr, live):
             # The streams come late (C1): prefetch everything, then poll.
             ws = norm_load(hc.norm_w, tid)
             units = _a1_units(hc, down, nb, part, lane)
-            mbx.pre_poll(hint, hc.producers, c.tag)
+            payload_wait(c, hint, hc.producers)
             (hs,) = poll_streams(c, hc, [rr])
         else:
             # h and w' first: the barrier keeps every wave's norm loads ahead
             # of any wave's weight stream in the CU's load pipe (oldest-first
             # issue would otherwise queue wave 7's h behind ~140 KiB of down
             # weights).
-            hs = norm_load(hc.h, tid, rr)
-            ws = norm_load(hc.norm_w, tid)
+            if const_expr(c.pre is not None and hc.down == "a1"):
+                hs, ws = c.pre  # a1_preload's, issued at the kernel's entry
+            else:
+                hs = norm_load(hc.h, tid, rr)
+                ws = norm_load(hc.norm_w, tid)
             rocdl.sched_barrier(0)
             gpu.barrier()
             units = _a1_units(hc, down, nb, part, lane)
         norm_sums(c, hc, hs)
         norm_inv(c, hc)
+        if const_expr(hc.wide_inv):
+            put_inv(c, hc, t, rr)
         if down:
             _a1_down(c, hc, g, hs, ws, units, rr)
         else:
@@ -509,6 +548,22 @@ def _a1_task(c, hc, t, rr, live):
 
 
 _a1_task = ASTRewriter.transform(_a1_task)
+
+
+def a1_preload(c, p):
+    """A1's ``h`` and ``w'`` loads of this CTA's task (``a1``'s row), issued
+    at the kernel's entry ahead of the step counter's use (the launch tag);
+    out of range (no memory traffic) on CTAs without an A1 task."""
+    t = task_index(c, "a1")
+    live = t < c.L.tasks["a1"]
+    if const_expr(c.rows == 1):
+        rr = 0
+    else:
+        n = c.rows * DOWN_GROUPS
+        rr = (t < n).select(t // DOWN_GROUPS, fx.max(t - n, 0) // C.hc_count)
+    return norm_load(p.h_in, c.tid, rr, keep=live), norm_load(
+        p.hc_norm_w, c.tid, keep=live
+    )
 
 
 def a1(c, hc):
@@ -567,14 +622,15 @@ def a2(c, hc):
         su = fx.Int32(bo.buffer_load(hc.s_up, nb * 64 + lane, vec_width=1, dtype=T.i32))
         ww = fx.Int32(bo.buffer_load(hc.norm_w, idx // 2, vec_width=1, dtype=T.i32))
         if const_expr(hc.polled):
-            mbx.pre_poll(c1_hint, hc.producers * rows, c.tag)
-            hws = [
-                v[0]
-                for v in mbx.poll(
-                    [(hc.h, mb_ix(idx // 2, r), 1) for r in range(rows)], c.tag
-                )
-            ]
-            halves_sums(c, hc)
+            if const_expr(not hc.wide_inv):
+                payload_wait(c, c1_hint, hc.producers * rows)
+                hws = [
+                    v[0]
+                    for v in mbx.poll(
+                        [(hc.h, mb_ix(idx // 2, r), 1) for r in range(rows)], c.tag
+                    )
+                ]
+                halves_sums(c, hc)
         else:
             hws = [
                 fx.Int32(
@@ -584,12 +640,23 @@ def a2(c, hc):
                 )
                 for r in range(rows)
             ]
-            for r in range_constexpr(rows):
-                norm_sums(c, hc, norm_load(hc.h, tid, r), r)
-        norm_inv(c, hc)
+            if const_expr(not hc.wide_inv):
+                for r in range_constexpr(rows):
+                    norm_sums(c, hc, norm_load(hc.h, tid, r), r)
+        if const_expr(not hc.wide_inv):
+            norm_inv(c, hc)
 
-        # The low-rank pack: 80 fp8 words then zeros to 96, 10 exponents then 127.
-        mbx.pre_poll(hint, DOWN_GROUPS * rows, c.tag)
+        # The low-rank pack: 80 fp8 words then zeros to 96, 10 exponents then
+        # 127; from INV_ROWS rows the streams' inverse RMS (A1's task 0 of each row).
+        payload_wait(c, hint, DOWN_GROUPS * rows)
+        if const_expr(hc.polled and hc.wide_inv):
+            # A1's tasks of a row polled all its streams before publishing.
+            hws = [
+                v[0]
+                for v in mbx.poll(
+                    [(hc.h, mb_ix(idx // 2, r), 1) for r in range(rows)], c.tag
+                )
+            ]
         if tid < C.hc_lowrank // 8:
             vs = mbx.poll([(hc.lr8, mb_ix(tid * 2, r), 2) for r in range(rows)], c.tag)
             for r in range_constexpr(rows):
@@ -611,6 +678,8 @@ def a2(c, hc):
                 fx.ptr_store(
                     fx.Int32(p2.SCALE_ONE), le + row_ix(tid - 192 + DOWN_GROUPS, r, sle)
                 )
+        if const_expr(hc.wide_inv):
+            poll_inv(c, hc)
         gpu.barrier()
 
         xl8, xle = mfma_operands(c, l8, le, "l8", "le")

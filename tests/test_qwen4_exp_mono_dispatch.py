@@ -603,3 +603,28 @@ def test_draft_attributes_pass_through(mtp):
     assert wrapper.model is draft.model
     assert wrapper.marker == "draft"
     assert wrapper.compute_draft_ids("h", out=None) == ("ids", "h")
+
+
+def test_the_fp4_head_is_installed_before_the_drafter_is_wrapped(mtp, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        dispatch,
+        "install_fp4_head",
+        lambda model, drafter: seen.append((model, drafter.model)),
+    )
+    model, draft = _Model(), _Draft()
+    drafter = SimpleNamespace(model=draft)
+    dispatch.install_mono_decode(model, _mtp_config(), drafter, _builder())
+    # the drafter's model is still ATOM's when its head is swapped
+    assert seen == [(model, draft)]
+    assert isinstance(drafter.model, dispatch.MonoDraftModel)
+
+
+def test_a_refused_deployment_keeps_the_head(mtp, monkeypatch):
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
+    seen = []
+    monkeypatch.setattr(dispatch, "install_fp4_head", lambda *a: seen.append(a))
+    dispatch.install_mono_decode(
+        _Model(), _mtp_config(), SimpleNamespace(model=_Draft()), _builder()
+    )
+    assert not seen

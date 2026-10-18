@@ -350,8 +350,10 @@ def qsa(prm):
     norms = {
         "q_norm": _norm(prm, a + "q_norm.weight", d),
         "k_norm": _norm(prm, a + "k_norm.weight", d),
-        "iq_norm": _norm(prm, a + "indexer.q_layernorm.weight", C.index_dim),
-        "ik_norm": _norm(prm, a + "indexer.k_layernorm.weight", C.index_dim),
+        # The indexer's norms keep the raw ``w``: the kernel adds the 1 in f32
+        # (``qsa.norm(..., zero_centered=True)``), as ATOM's and HF's Gemma norm.
+        "iq_norm": _get(prm, a + "indexer.q_layernorm.weight", (C.index_dim,), BF16),
+        "ik_norm": _get(prm, a + "indexer.k_layernorm.weight", (C.index_dim,), BF16),
     }
     return weights, norms
 

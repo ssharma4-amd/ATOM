@@ -77,6 +77,7 @@ from atom.models.qwen4_exp_mono.kernels.stages.common import (
     mb_ix,
     mfma_operands,
     mfma_row,
+    payload_wait,
     row_ix,
     task_index,
     task_rounds,
@@ -250,9 +251,18 @@ def _chain_step(s, big, new, acc):
 
 def m3(c, p):
     tid, lane, wave = c.tid, c.lane, c.wave
-    rows = c.rows
-    t = task_index(c, "m3")
     experts = c.experts
+    # Batched builds: task ``task`` runs router block ``t`` (the one-request
+    # task) for request rows ``h0 .. h0 + rows - 1``: every row, or a part of
+    # them per task (``layout``'s ``m3_task_rows``).
+    task = task_index(c, "m3")
+    rows = c.L.m3_task_rows
+    split = rows < c.rows
+    t, h0 = (
+        (task % (experts // 8 + 1), task // (experts // 8 + 1) * rows)
+        if split
+        else (task, 0)
+    )
     rw = c.lds_i + c.L.lds["rw"]
     rx = c.lds_f + c.L.lds["rx"]
     lgl = c.lds_f + c.L.lds["lgl"]
@@ -262,9 +272,9 @@ def m3(c, p):
     # Batched builds: hint ``m`` is M2 task ``m % 80`` of request row ``m // 80``.
     def hint(m):
         k, r = (m, 0) if rows == 1 else (m % (C.hidden // 32), m // (C.hidden // 32))
-        return c.mb_mxe, mb_ix(k, r)
+        return c.mb_mxe, mb_ix(k, h0 + r)
 
-    if t <= experts // 8:
+    if task < (experts // 8 + 1) * (c.rows // rows):
         # Chunk ``j``: 8 bf16 of row ``j // 320``; the gate task reads row E 8 times.
         ws = []
         for m in range_constexpr(RW_LOADS):
@@ -273,10 +283,14 @@ def m3(c, p):
             off = g * ROW_WORDS + (j % ROW_CHUNKS) * 4
             ws.append(fx.Vector(bo.buffer_load(p.r_w, off, vec_width=4, dtype=T.i32)))
 
-        mbx.pre_poll(hint, C.hidden // 32 * rows, c.tag)
+        payload_wait(c, hint, C.hidden // 32 * rows)
         hi = fx.min(tid + THREADS, RX_LOADS - 1)
         v = mbx.poll(
-            [(c.mb_mxbf, mb_ix(j * 2, r), 2) for r in range(rows) for j in (tid, hi)],
+            [
+                (c.mb_mxbf, mb_ix(j * 2, h0 + r), 2)
+                for r in range(rows)
+                for j in (tid, hi)
+            ],
             c.tag,
         )
         for r in range_constexpr(rows):
@@ -321,13 +335,13 @@ def m3(c, p):
                     fx.ptr_store(bf16r(total), lgl + row_ix(wave, rt, slg))
         gpu.barrier()
 
-        # Thread ``2 r + i``: logits ``8 t + 4 i ..`` of request row ``r``.
+        # Thread ``2 r + i``: logits ``8 t + 4 i ..`` of request row ``h0 + r``.
         li, lr = (tid, 0) if rows == 1 else (tid % 2, tid // 2)
         if (t < experts // 8) & (tid < 2 * rows):
             lg = lds_f4(lgl, row_ix(li * 4, lr, slg))
             mbx.put2(
                 c.mb_lg,
-                mb_ix(t * 4 + li * 2, lr),
+                mb_ix(t * 4 + li * 2, h0 + lr),
                 mbx.bf16_pair(lg[0], lg[1]),
                 mbx.bf16_pair(lg[2], lg[3]),
                 c.tag,
@@ -336,7 +350,7 @@ def m3(c, p):
             gl = lgl if rows == 1 else lgl + tid * slg
             mbx.put(
                 c.mb_sg,
-                0 if rows == 1 else mb_ix(0, tid),
+                mb_ix(0, h0) if rows == 1 else mb_ix(0, h0 + tid),
                 bf16r(sigmoid_acc(fx.ptr_load(gl))),
                 c.tag,
             )

@@ -26,7 +26,13 @@ from atom.models.qwen4_exp_mono.kernels import mailbox as mbx
 from atom.models.qwen4_exp_mono.kernels import p2
 from atom.models.qwen4_exp_mono.kernels.config import DEFAULT as C
 from atom.models.qwen4_exp_mono.kernels.config import GRID, THREADS
-from atom.models.qwen4_exp_mono.kernels.device_ops import rsrc, uniform, xred, xshfl
+from atom.models.qwen4_exp_mono.kernels.device_ops import (
+    opaque,
+    rsrc,
+    uniform,
+    xred,
+    xshfl,
+)
 from atom.models.qwen4_exp_mono.kernels.layout import (
     K_STRIDE,
     SCORE_TILE,
@@ -64,7 +70,6 @@ from atom.models.qwen4_exp_mono.kernels.stages.qsa import (
     SCALE,
     SEL,
     SELH_FROM_QN,
-    SQRT128,
     STATE,
     _cache_row,
     _entry,
@@ -78,7 +83,12 @@ from atom.models.qwen4_exp_mono.kernels.stages.qsa import (
     unpack,
     word,
 )
-from atom.models.qwen4_exp_mono.kernels.stages.qsa_fast import U, _rope16, _wave_sum64
+from atom.models.qwen4_exp_mono.kernels.stages.qsa_fast import (
+    _block_key,
+    _cached_scores,
+    _rope16,
+    _score,
+)
 
 
 def qsa_len(p, rows, group):
@@ -163,62 +173,34 @@ def q3(c, p):
             for e in range(2)
         ]
 
-        # Wave ``w`` of task ``tq`` takes blocks ``8 tq + w + i nw``, ``U`` of
-        # them per batch: the batch's loads first.
+        # As ``qsa_fast.q3``: the blocks below the group's first token's from
+        # ``index_cmp``, the rest from their raw keys.
         nw = per * WAVES
-        for b0 in range(tq * WAVES + wave, cb, U * nw):
-            bs = [b0 + u * nw for u in range(U)]
-            bc = [fx.min(b, cb - 1) for b in bs]
-            gs = [page_block(r_pg, b, True) for b in bc]
-            kws = [
-                [word(r_ik, (4 * gs[u] + r) * INDEX_WORDS + lane) for r in range(4)]
-                for u in range(U)
-            ]
-            ats = [4 * b * ROPE_WORDS + rope_word for b in bc]
-            kcs = [word(r_cos, a) for a in ats]
-            kss = [word(r_sin, a) for a in ats]
-            for u in range_constexpr(U):
-                b = bs[u]
-                if b < cb:
-                    raw = []
-                    for r in range_constexpr(4):
-                        row = 4 * b + r
-                        kw = kws[u][r]
-                        for s in range_constexpr(c.group):
-                            kw = (row == L - j + s).select(iks[s], kw)
-                        raw.append(unpack([fx.Int32(kw)]))
-                    pooled = [
-                        bf16r(
-                            ((raw[0][e] + raw[1][e]) + (raw[2][e] + raw[3][e]))
-                            * fx.Float32(0.25)
-                        )
-                        for e in range(2)
-                    ]
-                    kn = _rope16(
-                        norm(pooled, wk, R128, True),
-                        unpack([kcs[u]]),
-                        unpack([kss[u]]),
-                        lane,
-                        lane < ROPE_WORDS,
-                    )
-                    relu = []
-                    for h in range_constexpr(C.index_heads):
-                        part = (q[2 * h] * kn[0]).to(fx.Float64) + (
-                            q[2 * h + 1] * kn[1]
-                        ).to(fx.Float64)
-                        relu.append(
-                            fx.max(_wave_sum64(part).to(fx.Float32), fx.Float32(0.0))
-                        )
-                    score = ((relu[0] + relu[1]) + (relu[2] + relu[3])) / _f32(SQRT128)
-                    if lane == 0:
-                        mbx.put(c.mb_isc, mb_ix(b, rq), score, c.tag)
-                    # Row L completes block b: its key for ATOM's compressed cache.
-                    if 4 * b + 3 == L:
-                        bo.buffer_store(
-                            mbx.bf16_pair(kn[0], kn[1]),
-                            r_cmp,
-                            gs[u] * INDEX_WORDS + lane,
-                        )
+        first = tq * WAVES + wave
+        nc = (L - j) // 4
+        _cached_scores(c, rq, q, r_pg, r_cmp, first, nc, nw)
+        b = nc + first
+        if b < cb:
+            g = page_block(r_pg, b, True)
+            kws = [word(r_ik, (4 * g + r) * INDEX_WORDS + lane) for r in range(4)]
+            at = 4 * b * ROPE_WORDS + rope_word
+            kc, ks = word(r_cos, at), word(r_sin, at)
+            raw = []
+            for r in range_constexpr(4):
+                row = 4 * b + r
+                kw = kws[r]
+                for s in range_constexpr(c.group):
+                    kw = (row == L - j + s).select(iks[s], kw)
+                raw.append(unpack([fx.Int32(kw)]))
+            kn = _block_key(raw, wk, kc, ks, lane)
+            score = _score(q, kn)
+            if lane == 0:
+                mbx.put(c.mb_isc, mb_ix(b, rq), score, c.tag)
+            # Row L completes block b: its key for ATOM's compressed cache.
+            if 4 * b + 3 == L:
+                bo.buffer_store(
+                    mbx.bf16_pair(kn[0], kn[1]), r_cmp, g * INDEX_WORDS + lane
+                )
 
         gpu.barrier()
         if c.tid == 0:
@@ -228,12 +210,13 @@ def q3(c, p):
 q3 = ASTRewriter.transform(q3)
 
 
-def _q5(c, p, tid, t):
+def _q5(c, p, tid, t, turn):
     qs = c.lds_i + c.L.lds["q5_q"]
     ks = c.lds_i + c.L.lds["q5_k"]
     sl = c.lds_i + c.L.lds["q5_sel"]
-    # Tasks (tile, request row, kv head), tile-major, as a batched build's.
-    rq = (t // 2) % c.rows
+    # Tasks (tile, request row, kv head), tile-major, as a batched build's,
+    # the rows turned ``turn`` on (``q5``).
+    rq = (t // 2) % c.rows if turn is None else opaque((t // 2 + turn) % c.rows)
     L = row_len(p, rq)
     gb, j = _group_of(c, rq)
     a_pages = qsa_row(p, rq, "pages")
@@ -334,8 +317,16 @@ _q5 = ASTRewriter.transform(_q5)
 def q5(c, p):
     tid = fx.Int32(c.tid)
     t = task_index(c, "q5")
+    # A CTA's rounds run tasks GRID apart: where 2 rows divides GRID, all of
+    # one request row, so a long request's tiles would fall on the same CTAs
+    # every round. Round k turns the rows k groups on instead (a tile's tasks
+    # lie in one round, so the turn permutes its rows), each round's row
+    # ``opaque``: a row's addresses kept for its next round spill SGPRs at
+    # 16 rows.
+    turn = c.group if GRID % (2 * c.rows) == 0 else None
     for k in range_constexpr(task_rounds(c, "q5")):
-        _q5(c, p, tid, t if k == 0 else t + k * GRID)
+        rot = None if turn is None else k * turn % c.rows
+        _q5(c, p, tid, t if k == 0 else t + k * GRID, rot)
 
 
 def _q7(c, p, tid, lane, wave, t):

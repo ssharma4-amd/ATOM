@@ -3,15 +3,18 @@ blocks, for contexts up to :data:`MAX_CONTEXT` tokens.
 
 - Q3 runs on every CTA (``GRID / rows`` tasks per request row). Waves 0-3
   first build index query head ``w`` in LDS (zero-centered norm, RoPE at row
-  ``L``). Then each wave takes its blocks :data:`U` at a time, the batch's
-  pages, index keys and RoPE rows loaded before any of its math: it pools a
-  block's 4 index key rows (row ``L`` from the mailbox), normalizes and
-  rotates the pooled key at row ``4 b``, takes its 4 dot products in f64
-  (rounded to f32) and publishes the block's score (``isc``). The wave of the
-  block row ``L`` completes also stores its rotated key in the compressed key
-  cache, which only ATOM's own steps read. The 64-bit wave sums swap the
-  upper halves of the wave in VALU (``permlane``). Each task ends with its
-  hint (``fisch``).
+  ``L``). The blocks the step's first token's context completes take their
+  compressed keys from ``index_cmp``, where the step that completed each
+  wrote it (ATOM's own steps, prefill included, write theirs there too),
+  :data:`UC` blocks per wave at a time, the batch's loads first
+  (:func:`_cached_scores`). The blocks after them, at most one per wave, are
+  keyed from their 4 raw index key rows (:func:`_block_key`: row ``L`` from
+  the mailbox; pooled, normalized and rotated at row ``4 b``), and the wave
+  of the block row ``L`` completes stores its key in ``index_cmp``. A score
+  (:func:`_score`) takes the 4 dot products in f64 (rounded to f32) and is
+  published in ``isc``; a key Q3 wrote gives the bits its raw keys give. The
+  64-bit wave sums swap the upper halves of the wave in VALU (``permlane``).
+  Each task ends with its hint (``fisch``).
 - Q4 runs in two levels per request row: :data:`CHUNKS` chunk tasks, each
   selecting the 512 best of its :data:`FAST_CHUNK` blocks, and a final task
   selecting the 512 best of their candidates and ranking them, ties to the
@@ -24,8 +27,8 @@ folded score bits and ``0xFFFF - block``, unique -- and the radix passes
 (:data:`RADIX`) count the keys matching the prefix so far in one of three
 LDS histograms in turn, so that a pass needs one barrier: every wave scans
 the histogram it just filled while the one two passes on is cleared. The
-candidates go to LDS as 64-bit keys, and each one's rank is the number of
-keys above it (:func:`_rank`).
+candidates go to LDS as 64-bit keys, and a bitonic sort of them, one per
+thread, ranks them (:func:`_rank`).
 
 The scores and this module's mailboxes (:data:`FSC`) sit in the scratch
 buffer's second half (``layout.scratch_bytes``), :data:`SCORE_SHIFT` bytes
@@ -43,7 +46,13 @@ from atom.models.qwen4_exp_mono.kernels import buffer_ops as bo
 from atom.models.qwen4_exp_mono.kernels import mailbox as mbx
 from atom.models.qwen4_exp_mono.kernels.config import DEFAULT as C
 from atom.models.qwen4_exp_mono.kernels.config import GRID, THREADS
-from atom.models.qwen4_exp_mono.kernels.device_ops import rsrc, wave_umax_dpp, xshfl
+from atom.models.qwen4_exp_mono.kernels.device_ops import (
+    read_lane_i32,
+    rsrc,
+    wave_umax_dpp,
+    xshfl,
+)
+from atom.models.qwen4_exp_mono.kernels.dpp_utils import update_dpp_i32
 from atom.models.qwen4_exp_mono.kernels.layout import (
     BASE,
     MAX_ROWS,
@@ -59,6 +68,7 @@ from atom.models.qwen4_exp_mono.kernels.stages.hc import _f32
 from atom.models.qwen4_exp_mono.kernels.stages.qsa import (
     INDEX_WORDS,
     P_IK,
+    PAGE_BLOCKS,
     Q1_INDEX_TASKS,
     R128,
     ROPE_WORDS,
@@ -87,7 +97,11 @@ assert (
     SC["isc"] + MAX_BLOCKS * PAIR <= SCRATCH_BYTES
 )  # a row's scores end within its row
 
-U = 4  # Q3: blocks per wave per batch
+UC = 8  # Q3: blocks per wave per batch, from their compressed keys
+SPAN = 64 * PAGE_BLOCKS  # Q3: a wave's blocks per load of their page entries
+assert UC % PAGE_BLOCKS == 0  # a batch takes whole pages
+_S = 6 - (4 * UC).bit_length() + 1  # Q3: the butterfly steps after the scatter
+assert 4 * UC == 64 >> _S and C.index_heads == 4
 FAST_CHUNK = 8192  # Q4: blocks per chunk task
 CHUNKS = MAX_BLOCKS // FAST_CHUNK  # 8
 Q4_TASKS = CHUNKS + 1  # per request row: the chunk tasks, then the final one
@@ -117,12 +131,21 @@ for _name, _pairs in _FAST_REGIONS.items():
 assert _off <= SC["isc"]  # before the row's scores
 
 # LDS words from ``q4_keys``: the three radix histograms, the waves' counts,
-# then the candidates' 64-bit keys (two words each) and blocks.
+# the candidates' 64-bit keys (two words each) and blocks, then pass 0's
+# histogram in ``COPIES`` copies, lane ``l`` counting into copy ``l % COPIES``:
+# its keys' digits are few (the scores' exponents), and lanes adding to one
+# LDS word wait on each other. Copies ``H0_STRIDE`` words apart sit on
+# distinct banks.
 H_WORDS = 256
 CNT = 3 * H_WORDS
 CK = CNT + 256
 CB = CK + 2 * SEL
-LDS_WORDS = CB + SEL
+COPIES = 8
+H0_STRIDE = H_WORDS + 4
+H0 = CB + SEL
+H0_CLEAR = -(-COPIES * H0_STRIDE // THREADS) * THREADS  # whole rounds of THREADS
+LDS_WORDS = H0 + H0_CLEAR
+assert H0 % 4 == 0 and H0_STRIDE % 4 == 0  # _lds_i4's 16-byte loads
 assert LDS_WORDS <= STRIDE["q4_keys"]
 
 
@@ -138,33 +161,97 @@ def _mailboxes(c):
 # ------------------------------------------------------------------ Q3
 
 
-def _swap(v, off):
-    """(the lower lane's ``v``, the upper lane's) of lanes ``l`` and ``l ^
-    off`` (32 or 16), in VALU, as ``device_ops.xred``."""
+def _permswap(a, b, off):
+    """``v_permlane32_swap`` / ``v_permlane16_swap`` (``off`` 32 / 16) of
+    words ``a`` and ``b``: ``a``'s upper lanes (``l & off``) trade places with
+    ``b``'s lower ones, so of lanes ``l`` and ``l ^ off`` the lower gets
+    (its ``a``, the upper's ``a``) and the upper (the lower's ``b``, its ``b``)."""
     swap = rocdl.permlane32_swap if off == 32 else rocdl.permlane16_swap
     pair = swap(
         llvm.StructType.get_literal([T.i32, T.i32]),
-        as_ir_value(fx.Int32(v)),
-        as_ir_value(fx.Int32(v)),
+        as_ir_value(fx.Int32(a)),
+        as_ir_value(fx.Int32(b)),
         False,
         False,
     )
     return tuple(fx.Int32(llvm.extractvalue(T.i32, pair, [k])) for k in range(2))
 
 
+def _swap(v, off):
+    """(the lower lane's ``v``, the upper lane's) of lanes ``l`` and ``l ^
+    off`` (32 or 16), in VALU, as ``device_ops.xred``."""
+    return _permswap(v, v, off)
+
+
+def _words(v):
+    return fx.Vector.from_elements([v], fx.Float64).bitcast(fx.Int32)
+
+
+def _f64(words):
+    return fx.Vector.from_elements(list(words), fx.Int32).bitcast(fx.Float64)[0]
+
+
 def _wave_sum64(v):
     """Butterfly sum of an f64 over the wave; every lane gets the same bits.
     The 32 and 16 steps swap in VALU (:func:`_swap`)."""
     for off in (32, 16, 8, 4, 2, 1):
-        w = fx.Vector.from_elements([v], fx.Float64).bitcast(fx.Int32)
+        w = _words(v)
         if off >= 16:
             halves = [_swap(w[0], off), _swap(w[1], off)]
-            a = fx.Vector.from_elements([halves[0][0], halves[1][0]], fx.Int32)
-            b = fx.Vector.from_elements([halves[0][1], halves[1][1]], fx.Int32)
-            v = a.bitcast(fx.Float64)[0] + b.bitcast(fx.Float64)[0]
+            v = _f64([h[0] for h in halves]) + _f64([h[1] for h in halves])
         else:
-            o = fx.Vector.from_elements([xshfl(w[0], off), xshfl(w[1], off)], fx.Int32)
-            v = v + o.bitcast(fx.Float64)[0]
+            v = v + _f64([xshfl(w[0], off), xshfl(w[1], off)])
+    return v
+
+
+# Row shifts by 8 / 4 (right, then left) and the banks of the lanes with that
+# bit set (``device_ops.xshfl``'s DPP).
+_DPP_HALF = {8: (0x118, 0x108, 0xC), 4: (0x114, 0x104, 0xA)}
+
+
+def _scatter_step(lo, hi, off, lane):
+    """One step of :func:`_wave_sum64`'s butterfly over many values at once:
+    lane ``l`` and lane ``l ^ off`` each keep half of them (the lower lane
+    ``lo``, the upper ``hi``) and add the partner's copy, which halves the
+    values per lane. Each sum adds the butterfly's two values (the 32 / 16
+    steps in its order), so it has its bits."""
+    out = []
+    for a, b in zip(lo, hi):
+        wa, wb = _words(a), _words(b)
+        if off >= 16:
+            pairs = [_permswap(wa[k], wb[k], off) for k in range(2)]
+            out.append(_f64([q[0] for q in pairs]) + _f64([q[1] for q in pairs]))
+            continue
+        upper = (lane & off) != 0
+        if off in _DPP_HALF:
+            shr, shl, banks = _DPP_HALF[off]
+            got = []
+            for k in range(2):
+                r = fx.Int32(update_dpp_i32(wb[k], wb[k], shr, 0xF, banks, False))
+                got.append(
+                    fx.Int32(update_dpp_i32(r, wa[k], shl, 0xF, 0xF ^ banks, False))
+                )
+        else:
+            send = _words(upper.select(a, b))
+            got = [xshfl(send[k], off) for k in range(2)]
+        out.append(upper.select(b, a) + _f64(got))
+    return out
+
+
+def _scatter_sums(vals, lane):
+    """The wave sums (:func:`_wave_sum64`'s bits) of the ``2^n`` (``n`` <= 6)
+    values each lane holds in ``vals``: lane ``l`` ends with the sum of value
+    ``l >> (6 - n)``."""
+    off = 32
+    while len(vals) > 1:
+        half = len(vals) // 2
+        vals = _scatter_step(vals[:half], vals[half:], off, lane)
+        off //= 2
+    v = vals[0]
+    while off:
+        w = _words(v)
+        v = v + _f64([xshfl(w[0], off), xshfl(w[1], off)])
+        off //= 2
     return v
 
 
@@ -178,6 +265,101 @@ def _rope16(y, cs, sn, lane, active):
         partner = (partner ^ neg).bitcast(fx.Float32)
         out.append(active.select(bf16r(bf16r(v * c) + bf16r(partner * s)), v))
     return out
+
+
+def _block_key(raw, wk, kc, ks, lane):
+    """A block's compressed key (this lane's pair) from its four raw index
+    key rows ``raw`` (this lane's pairs), ``wk`` the norm weight and ``kc`` /
+    ``ks`` the RoPE words of the block's first token: the pooled mean, the
+    zero-centred norm, RoPE. bf16 values: ``index_cmp``'s row holds them."""
+    pooled = [
+        bf16r(((raw[0][e] + raw[1][e]) + (raw[2][e] + raw[3][e])) * fx.Float32(0.25))
+        for e in range(2)
+    ]
+    y = norm(pooled, wk, R128, True)
+    return _rope16(y, unpack([kc]), unpack([ks]), lane, lane < ROPE_WORDS)
+
+
+def _score(q, kn):
+    """A block's score from the index heads' queries ``q`` and its key ``kn``
+    (this lane's pairs): the relu of each head's dot product (a 64-bit wave
+    sum), their sum over sqrt(128)."""
+    relu = []
+    for h in range(C.index_heads):
+        part = (q[2 * h] * kn[0]).to(fx.Float64) + (q[2 * h + 1] * kn[1]).to(fx.Float64)
+        relu.append(fx.max(_wave_sum64(part).to(fx.Float32), fx.Float32(0.0)))
+    return ((relu[0] + relu[1]) + (relu[2] + relu[3])) / _f32(SQRT128)
+
+
+def _fma64(a, b, c):
+    return fx.Float64(
+        llvm.call_intrinsic(
+            T.f64, "llvm.fma.f64", [fx.Float64(v).ir_value() for v in (a, b, c)], [], []
+        )
+    )
+
+
+def _cached_scores(c, rq, q, r_pg, r_cmp, first, nc, nw):
+    """Row ``rq``'s scores of the blocks below ``nc`` from their
+    ``index_cmp`` rows. Those rows hold the bits Q3 computes from the raw
+    keys: the step that last ran a block's fourth token wrote them, after
+    its other tokens' last runs (a step that reruns a token reruns every
+    later one), and a step runs only tokens past every block below ``nc``.
+
+    While no wave has two blocks (``nc`` up to ``nw``: contexts to ~8K at
+    one row), wave ``first`` takes block ``first`` with :func:`_score`.
+    Past that, every wave of the row (the test is the row's: a wave left on
+    block ``first`` would leave blocks no wave scores, and Q4 would wait on
+    them) takes ``nb`` consecutive blocks from ``first nb``, :data:`UC` per
+    batch: its page entries come in one load per :data:`SPAN` blocks (lane
+    ``l`` the ``l``-th page), so a batch's key loads wait on no other load.
+    The batch's ``4 UC`` head sums are reduce-scattered
+    (:func:`_scatter_sums`), each pair's two products one f64 multiply and
+    fma: the f32 products of bf16 ``q`` and keys are exact, so these are
+    :func:`_score`'s sums. Lane ``l`` ends with head ``(l >> S) & 3`` of
+    block ``l >> (S + 2)``, the relus add as :func:`_score`'s, and one store
+    puts the batch's scores."""
+    lane = c.lane
+    if nc <= nw:
+        if first < nc:
+            g = page_block(r_pg, first, True)
+            score = _score(q, unpack([word(r_cmp, g * INDEX_WORDS + lane)]))
+            if lane == 0:
+                mbx.put(c.mb_isc, mb_ix(first, rq), score, c.tag)
+    else:
+        qd = [v.to(fx.Float64) for v in q]
+        nb = (nc + nw * UC - 1) // (nw * UC) * UC
+        start = first * nb
+        end = fx.min(start + nb, nc)
+        last = (end - 1) // PAGE_BLOCKS
+        for s0 in range(start, end, SPAN):
+            pg = word(r_pg, fx.min(s0 // PAGE_BLOCKS + lane, last))
+            # Here, so the batches' reads of pg wait on no batch's store.
+            rocdl.s_waitcnt(vmcnt=0)
+            for b0 in range(s0, fx.min(s0 + SPAN, end), UC):
+                at = (b0 - s0) // PAGE_BLOCKS
+                pages = [read_lane_i32(pg, at + k) for k in range(UC // PAGE_BLOCKS)]
+                gs = [
+                    pages[u // PAGE_BLOCKS] * PAGE_BLOCKS + u % PAGE_BLOCKS
+                    for u in range(UC)
+                ]
+                kws = [word(r_cmp, g * INDEX_WORDS + lane) for g in gs]
+                parts = []
+                for u in range_constexpr(UC):
+                    kd = [v.to(fx.Float64) for v in unpack([kws[u]])]
+                    for h in range_constexpr(C.index_heads):
+                        parts.append(_fma64(qd[2 * h + 1], kd[1], qd[2 * h] * kd[0]))
+                relu = fx.max(
+                    _scatter_sums(parts, lane).to(fx.Float32), fx.Float32(0.0)
+                )
+                pair = relu + xshfl(relu, 1 << _S)
+                score = pair + xshfl(pair, 2 << _S)
+                b = b0 + (lane >> (_S + 2))
+                if ((lane & ((4 << _S) - 1)) == 0) & (b < end):
+                    mbx.put(c.mb_isc, mb_ix(b, rq), score / _f32(SQRT128), c.tag)
+
+
+_cached_scores = ASTRewriter.transform(_cached_scores)
 
 
 def q3(c, p):
@@ -230,65 +412,42 @@ def q3(c, p):
             for e in range(2)
         ]
 
-        # Wave ``w`` of task ``tq`` takes blocks ``8 tq + w + i nw``, ``U`` of
-        # them per batch: the batch's loads first.
+        # Wave ``w`` of task ``tq`` is wave ``first`` of the row's ``nw``. The
+        # blocks the step's first token's context completes are keyed by the
+        # rows earlier steps wrote to ``index_cmp`` (:func:`_cached_scores`);
+        # the rest, at most one per wave, from their raw keys, and the row
+        # that completes one writes its compressed key.
         nw = per * WAVES
-        for b0 in range(tq * WAVES + wave, cb, U * nw):
-            bs = [b0 + u * nw for u in range(U)]
-            bc = [fx.min(b, cb - 1) for b in bs]
-            gs = [page_block(r_pg, b, True) for b in bc]
-            kws = [
-                [word(r_ik, (4 * gs[u] + r) * INDEX_WORDS + lane) for r in range(4)]
-                for u in range(U)
-            ]
-            ats = [4 * b * ROPE_WORDS + rope_word for b in bc]
-            kcs = [word(r_cos, a) for a in ats]
-            kss = [word(r_sin, a) for a in ats]
-            for u in range_constexpr(U):
-                b = bs[u]
-                if b < cb:
-                    raw = []
-                    for r in range_constexpr(4):
-                        row = 4 * b + r
-                        kw = kws[u][r]
-                        if const_expr(c.seq):
-                            for s in range_constexpr(c.rows):
-                                kw = (row == p.Ls[s]).select(iks[s], kw)
-                            raw.append(unpack([fx.Int32(kw)]))
-                        else:
-                            raw.append(unpack([fx.Int32((row == L).select(ik, kw))]))
-                    pooled = [
-                        bf16r(
-                            ((raw[0][e] + raw[1][e]) + (raw[2][e] + raw[3][e]))
-                            * fx.Float32(0.25)
-                        )
-                        for e in range(2)
-                    ]
-                    kn = _rope16(
-                        norm(pooled, wk, R128, True),
-                        unpack([kcs[u]]),
-                        unpack([kss[u]]),
-                        lane,
-                        lane < ROPE_WORDS,
-                    )
-                    relu = []
-                    for h in range_constexpr(C.index_heads):
-                        part = (q[2 * h] * kn[0]).to(fx.Float64) + (
-                            q[2 * h + 1] * kn[1]
-                        ).to(fx.Float64)
-                        relu.append(
-                            fx.max(_wave_sum64(part).to(fx.Float32), fx.Float32(0.0))
-                        )
-                    score = ((relu[0] + relu[1]) + (relu[2] + relu[3])) / _f32(SQRT128)
-                    if lane == 0:
-                        mbx.put(c.mb_isc, mb_ix(b, rq), score, c.tag)
-                    # Row L completes block b: its key for ATOM's compressed cache.
-                    if 4 * b + 3 == L:
-                        bo.buffer_store(
-                            mbx.bf16_pair(kn[0], kn[1]),
-                            r_cmp,
-                            gs[u] * INDEX_WORDS + lane,
-                        )
+        first = tq * WAVES + wave
+        nc = L // 4
+        if const_expr(c.seq):
+            nc = p.Ls[0] // 4
+        _cached_scores(c, rq, q, r_pg, r_cmp, first, nc, nw)
+        b = nc + first
+        if b < cb:
+            g = page_block(r_pg, b, True)
+            kws = [word(r_ik, (4 * g + r) * INDEX_WORDS + lane) for r in range(4)]
+            at = 4 * b * ROPE_WORDS + rope_word
+            kc, ks = word(r_cos, at), word(r_sin, at)
+            raw = []
+            for r in range_constexpr(4):
+                row = 4 * b + r
+                kw = kws[r]
+                if const_expr(c.seq):
+                    for s in range_constexpr(c.rows):
+                        kw = (row == p.Ls[s]).select(iks[s], kw)
+                    raw.append(unpack([fx.Int32(kw)]))
+                else:
+                    raw.append(unpack([fx.Int32((row == L).select(ik, kw))]))
+            kn = _block_key(raw, wk, kc, ks, lane)
+            score = _score(q, kn)
+            if lane == 0:
+                mbx.put(c.mb_isc, mb_ix(b, rq), score, c.tag)
+            # Row L completes block b: its key for ATOM's compressed cache.
+            if 4 * b + 3 == L:
+                bo.buffer_store(
+                    mbx.bf16_pair(kn[0], kn[1]), r_cmp, g * INDEX_WORDS + lane
+                )
 
         gpu.barrier()
         if c.tid == 0:
@@ -302,59 +461,91 @@ q3 = ASTRewriter.transform(q3)
 
 
 def _clear(c, k0):
-    """Histograms 0 and 1 to zero (``THREADS`` words); a barrier must follow
+    """Histograms 0 and 1 and pass 0's copies to zero; a barrier must follow
     before the first pass."""
     fx.ptr_store(fx.Int32(0), k0 + fx.Int32(c.tid))
+    for e in range_constexpr(H0_CLEAR // THREADS):
+        fx.ptr_store(fx.Int32(0), k0 + (H0 + THREADS * e + c.tid))
 
 
-def _digit(c, h, which, shift, prefix, remain):
-    """From the counts in histogram ``h``, the digit at ``shift`` of the
-    ``remain``-th largest key among those matching ``prefix``: the extended
-    prefix and the count still to take. In every wave: lane ``l`` scans digits
-    ``255 - 4 l ..``; the one lane holding the digit packs it with the count."""
+def _digit(c, h, which, shift, prefix, remain, copies=1):
+    """From the counts in histogram ``h`` (the sum of its ``copies``), the
+    digit at ``shift`` of the ``remain``-th largest key among those matching
+    ``prefix``: the extended prefix, the count still to take and whether that
+    is all of the digit's keys (1 or 0). In every wave: lane ``l`` scans
+    digits ``255 - 4 l ..``; the one lane holding the digit packs the three."""
     lane = c.lane
     v = _lds_i4(h, 252 - 4 * lane)
+    for k in range_constexpr(1, copies):
+        w = _lds_i4(h + H0_STRIDE * k, 252 - 4 * lane)
+        v = [a + b for a, b in zip(v, w)]
     cnt = [v[3], v[2], v[1], v[0]]  # digits 255 - 4 l, 254 - 4 l, ...
     tot = (cnt[0] + cnt[1]) + (cnt[2] + cnt[3])
     above = fx.coop.warp_inclusive_scan(tot, fx.ReductionOp.ADD, width=64) - tot
     pick = fx.Int32(0)
     for k in range_constexpr(4):
         hit = (above < remain) & (above + cnt[k] >= remain)
-        pick = hit.select(((255 - 4 * lane - k) << 16) | (remain - above), pick)
+        whole = (above + cnt[k] == remain).select(fx.Int32(1 << 24), fx.Int32(0))
+        pick = hit.select(whole | ((255 - 4 * lane - k) << 16) | (remain - above), pick)
         above = above + cnt[k]
     got = wave_umax_dpp(pick)
-    return prefix | ((got >> 16) << shift), got & 0xFFFF
+    return prefix | (((got >> 16) & 255) << shift), got & 0xFFFF, got >> 24
+
+
+def _count(c, k0, hi, lo, k, prefix, mask):
+    """Radix pass ``k``'s histogram: the keys matching ``prefix`` under
+    ``mask`` (pass 0: every key but ``hi`` -1) counted by their digit; then
+    the barrier, and the histogram two passes on cleared."""
+    tid = fx.Int32(c.tid)
+    which, shift = RADIX[k]
+    h = k0 + H_WORDS * (k % 3)
+    if const_expr(k == 0):
+        h = k0 + (H0 + H0_STRIDE * (c.lane & (COPIES - 1)))
+    for e in range_constexpr(len(hi)):
+        m = hi[e] >= 0
+        if const_expr(k > 0):
+            m = ((hi[e] & _i32(mask[0])) == prefix[0]) & (
+                (lo[e] & _i32(mask[1])) == prefix[1]
+            )
+        if m:
+            d = ((hi[e], lo[e])[which] >> shift) & 255
+            fx.atomic_add(h + d, fx.Int32(1), syncscope="workgroup")
+    gpu.barrier()
+    # The histogram of pass k + 2, read by every wave in pass k - 1.
+    if const_expr(k + 2 < len(RADIX)):
+        if tid < H_WORDS:
+            fx.ptr_store(fx.Int32(0), k0 + (H_WORDS * ((k + 2) % 3) + tid))
+
+
+_count = ASTRewriter.transform(_count)
 
 
 def _select(c, k0, hi, lo):
     """The 512th largest of the keys ``(hi, lo)`` this CTA's threads hold,
     as ``[hi, lo]``; a key ``hi`` -1 holds no block, and no pass counts it
-    (the first tests it, the others' prefixes clear its top bit).
-    Histograms 0 and 1 cleared."""
-    tid = fx.Int32(c.tid)
-    prefix = [fx.Int32(0), fx.Int32(0)]
+    (the first tests it, the others' prefixes clear its top bit). Once a
+    pass takes its digit's keys whole, the rest are skipped: the prefix,
+    its lower bits 0, keeps the same keys (the keys are unique).
+    Histograms 0 and 1 and pass 0's copies cleared."""
+    p0, p1 = fx.Int32(0), fx.Int32(0)
     mask = [0, 0]
     remain = fx.Int32(SEL)
+    live = fx.Int32(1)  # the same in every thread
     for k in range_constexpr(len(RADIX)):
         which, shift = RADIX[k]
-        h = k0 + H_WORDS * (k % 3)
-        for e in range_constexpr(len(hi)):
-            m = hi[e] >= 0
-            if const_expr(k > 0):
-                m = ((hi[e] & _i32(mask[0])) == prefix[0]) & (
-                    (lo[e] & _i32(mask[1])) == prefix[1]
-                )
-            if m:
-                d = ((hi[e], lo[e])[which] >> shift) & 255
-                fx.atomic_add(h + d, fx.Int32(1), syncscope="workgroup")
-        gpu.barrier()
-        # The histogram of pass k + 2, read by every wave in pass k - 1.
-        if const_expr(k + 2 < len(RADIX)):
-            if tid < H_WORDS:
-                fx.ptr_store(fx.Int32(0), k0 + (H_WORDS * ((k + 2) % 3) + tid))
-        prefix[which], remain = _digit(c, h, which, shift, prefix[which], remain)
+        h, copies = (k0 + H0, COPIES) if k == 0 else (k0 + H_WORDS * (k % 3), 1)
+        if live != 0:
+            _count(c, k0, hi, lo, k, [p0, p1], mask)
+            got, remain, whole = _digit(
+                c, h, which, shift, [p0, p1][which], remain, copies
+            )
+            if const_expr(which == 0):
+                p0 = got
+            else:
+                p1 = got
+            live = whole ^ 1
         mask[which] |= 0xFF << shift
-    return prefix
+    return [p0, p1]
 
 
 _select = ASTRewriter.transform(_select)
@@ -470,29 +661,72 @@ def _chunk(c, j, cb, busy, per, k0, rq):
 _chunk = ASTRewriter.transform(_chunk)
 
 
-def _rank(c, k0, n, rq):
-    """Each of the ``n`` candidates in LDS to ``sel`` at its rank (the keys
-    above it), then the hint."""
+def _xchg64(c, k0, key, stride, buf):
+    """The int64 ``key`` of thread ``tid ^ stride``: in-wave (VALU swaps)
+    below 64, else through LDS words ``buf ..`` (one key per thread, after a
+    barrier)."""
+    w = fx.Vector.from_elements([key], fx.Int64).bitcast(fx.Int32)
+    if const_expr(stride >= 64):
+        at = k0 + (buf + 2 * c.tid)
+        fx.ptr_store(w[0], at)
+        fx.ptr_store(w[1], at + 1)
+        gpu.barrier()
+        at = k0 + (buf + 2 * (c.tid ^ stride))
+        got = [fx.ptr_load(at), fx.ptr_load(at + 1)]
+    elif const_expr(stride >= 16):
+        upper = (c.lane & stride) != 0
+        got = []
+        for k in range_constexpr(2):
+            lo_, hi_ = _swap(w[k], stride)
+            got.append(upper.select(lo_, hi_))
+    else:
+        got = [xshfl(w[k], stride) for k in range(2)]
+    return fx.Vector.from_elements(got, fx.Int32).bitcast(fx.Int64)[0]
+
+
+def _sort(c, k0, key):
+    """The CTA's keys (one per thread: unique, or -1) largest first, thread
+    ``tid`` getting the ``tid``-th: a bitonic sort, the exchanges across
+    waves through LDS words 0 .. 1024 and ``CK ..`` in turn (free once the
+    keys are loaded: every exchange's barrier follows the reads before)."""
     tid = fx.Int32(c.tid)
-    n32 = (n + 31) // 32 * 32
-    if (tid >= n) & (tid < n32):
-        fx.ptr_store(fx.Int32(-1), k0 + (CK + 2 * tid))  # below every key
-        fx.ptr_store(fx.Int32(-1), k0 + (CK + 2 * tid + 1))
+    bufs = (0, CK)
+    n = 0
+    size = 2
+    while size <= THREADS:
+        stride = size // 2
+        while stride:
+            other = _xchg64(c, k0, key, stride, bufs[n % 2])
+            if stride >= 64:
+                n += 1
+            # The lower thread of a pair keeps the larger key in the blocks
+            # sorting down (``tid & size`` 0: all of them at the last size).
+            down = (
+                (tid >> (stride.bit_length() - 1)) ^ (tid >> (size.bit_length() - 1))
+            ) & 1
+            up = (other > key).select(fx.Int32(1), fx.Int32(0))
+            key = (up == (down ^ 1)).select(other, key)
+            stride //= 2
+        size *= 2
+    return key
+
+
+def _rank(c, k0, n, rq):
+    """The ``n`` candidates in LDS to ``sel`` at their ranks (the keys
+    above each): sorted (:func:`_sort`), thread ``tid`` puts the ``tid``-th
+    one's block; then the hint."""
+    tid = fx.Int32(c.tid)
     gpu.barrier()
-    if tid < n:
-        mine = fx.Vector.from_elements(
-            [fx.ptr_load(k0 + (CK + 2 * tid)), fx.ptr_load(k0 + (CK + 2 * tid + 1))],
-            fx.Int32,
-        ).bitcast(fx.Int64)[0]
-        mb = fx.ptr_load(k0 + (CB + tid))
-        rank = fx.Int32(0)
-        for j in range(0, n32, 32):
-            for q in range_constexpr(16):
-                v = _lds_i4(k0, CK + 2 * j + 4 * q)
-                two = fx.Vector.from_elements(v, fx.Int32).bitcast(fx.Int64)
-                for e in range_constexpr(2):
-                    rank = rank + (two[e] > mine).select(fx.Int32(1), fx.Int32(0))
-        mbx.put(c.mb_sel, mb_ix(rank, rq), mb, c.tag)
+    have = tid < n
+    w0 = have.select(
+        fx.ptr_load(k0 + (CK + 2 * tid)), fx.Int32(-1)
+    )  # -1: below every key
+    w1 = have.select(fx.ptr_load(k0 + (CK + 2 * tid + 1)), fx.Int32(-1))
+    key = fx.Vector.from_elements([w0, w1], fx.Int32).bitcast(fx.Int64)[0]
+    key = _sort(c, k0, key)
+    if have:
+        lo = fx.Vector.from_elements([key], fx.Int64).bitcast(fx.Int32)[0] & 0xFFFF
+        mbx.put(c.mb_sel, mb_ix(tid, rq), 0xFFFF - lo, c.tag)
     gpu.barrier()
     if tid == 0:
         mbx.put(c.mb_selh, mb_ix(0, rq), 1, c.tag)

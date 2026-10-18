@@ -1057,7 +1057,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor):
         if self.extra_output_dims:
-            hidden_states, _ = self.model.hyper_connection_mixer.mix(
+            hidden_states = self.model.hyper_connection_mixer.mix_final(
                 hidden_states.flatten(1)
             )
         return self.lm_head(hidden_states)

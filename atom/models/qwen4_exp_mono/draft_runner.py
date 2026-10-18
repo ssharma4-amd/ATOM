@@ -13,8 +13,10 @@ launches leave a speculative step host-bound.
 :class:`Qwen4MonoDraftRunner` runs that decoder layer as one mono QSA launch:
 the target's build (``build_layer`` is cached) with the draft layer's weights
 and caches, its own step counter and mailbox scratch, and layer id 48 (the
-target's are 0 .. 47). The front end and the head stay ATOM's ops. After a
-verify of one request a draft step is
+target's are 0 .. 47). The front end is one launch too (``front``), op for
+op as ATOM's but for its summation order; the head stays ATOM's ops, its
+``lm_head`` the target's MXFP4 one (``head``). After a verify of one request
+a draft step is
 
 - step 0 of a verify, the target's ``k + 1`` rows of one request: the seq
   build of ``k + 1`` rows, as the target's verify runs;
@@ -48,6 +50,8 @@ import torch
 from atom.utils.forward_context import get_forward_context
 
 from . import weights as W
+from .front import DraftFront, draft_front
+from .front import refusal as front_refusal
 from .group_meta import write_group_draft_meta
 from .kernels.config import from_dict
 from .kernels.kernel import LAYER_ARGS, STAGES, build_layer
@@ -98,6 +102,11 @@ class Qwen4MonoDraftRunner:
         assert max_groups * verify_rows <= WIDE_ROWS
         self.predictor = draft.model
         (layer,) = self.predictor.layers
+        # the front end in one launch, else ATOM's ops
+        why = front_refusal(self.predictor)
+        self.front = DraftFront(self.predictor) if why is None else None
+        if why is not None:
+            logger.info("Qwen3.8 mono draft: front end op for op: %s", why)
         self.layer_id = g.layers
         self.bound = W.bind_layer(layer, self.layer_id, "qsa", g.experts)
         self.caches = bind_qsa_caches(metadata_builder, layer, self.layer_id)
@@ -192,15 +201,7 @@ class Qwen4MonoDraftRunner:
             w = self.single[n]
         else:
             w = (self.step0 if md.max_seqlen_q == self.verify_rows else self.later)[n]
-        # the drafter's front end, op for op
-        embedding = p.fc_embedding(p.pre_fc_norm_embedding(p.embed_tokens(ids)))
-        hidden = p.pre_fc_norm_hidden(hidden_states.reshape(n, -1))
-        hidden = p.fc_hidden(hidden.reshape(-1, g.hidden))
-        torch.add(
-            hidden.view(n, g.hc_count, g.hidden),
-            embedding[:, None, :],
-            out=w.h_in.view(n, g.hc_count, g.hidden),
-        )
+        draft_front(self.front, p, ids, hidden_states.reshape(n, -1), w.h_in)
         qsa = md.qsa_metadata
         meta = (qsa.logical_positions, qsa.block_tables, w.pos, w.qsa)
         if single:

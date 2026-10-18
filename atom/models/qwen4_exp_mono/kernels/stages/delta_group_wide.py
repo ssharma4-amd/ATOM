@@ -2,16 +2,14 @@
 stages with the mixed rows polled in rounds, every request row's MFMA result
 stored from its lanes (``common_wide``), and B3's per-row work past the
 CTA's threads in rounds: the qkvz loads (:func:`_qkvz_round`), the b and a
-chains 4 request rows at a time (:func:`_ba_chains`) and the q and k norms
+chains 4 request rows at a time (:func:`_ba_chains`, on the mixed rows held
+as bf16 words: all rows fit one pass) and the q and k norms
 (:func:`_qk_norms`). Each row's q and k load with its recurrence step, which
-stores its state at once. Past ``WAVES`` rows B1's epilogue runs in passes of
-``WAVES`` request rows (:func:`_b1_out`), and B3 in passes of whole groups
-(``layout_wide``'s ``b3_rows``, :func:`b3`).
+stores its state at once. Past ``WAVES`` rows B1's and B3's epilogues run in
+passes of ``WAVES`` request rows (:func:`_b1_out`, :func:`_b3_out`).
 
 Derived from delta_group.py; delta_group.py stays the source.
 """
-
-from types import SimpleNamespace
 
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
@@ -33,8 +31,6 @@ from atom.models.qwen4_exp_mono.kernels.device_ops import (
 from atom.models.qwen4_exp_mono.kernels.layout import (
     RW_PART,
     RW_ROW,
-    RX_PART,
-    SCRATCH_BYTES,
     WAVES,
     b3_tiles,
 )
@@ -56,7 +52,6 @@ from atom.models.qwen4_exp_mono.kernels.stages.common import (
     task_index,
 )
 from atom.models.qwen4_exp_mono.kernels.stages.common_wide import (
-    fresh_round,
     poll_mixed_wide,
     store_rows,
 )
@@ -75,7 +70,6 @@ from atom.models.qwen4_exp_mono.kernels.stages.moe import (
     CHAIN_STEPS,
     _chain_step,
     _part,
-    _store_x,
 )
 
 
@@ -248,23 +242,24 @@ _qkvz_round = ASTRewriter.transform(_qkvz_round)
 
 def _ba_chains(c, baw, bax, tile):
     """B3's b and a chains of request rows ``4 tile ..`` (4 at most): waves
-    ``1 + 2 tile`` (b) and ``2 + 2 tile`` (a), lane ``16 i + q`` part ``q`` of
-    request row ``4 tile + i``, as ``delta_group.b3``'s waves 1-2, lane
-    ``16 r + q``."""
+    ``1 + 2 tile`` (b) and ``2 + 2 tile`` (a), mod ``WAVES``, lane ``16 i + q``
+    part ``q`` of request row ``4 tile + i``, as ``delta_group.b3``'s waves
+    1-2, lane ``16 r + q``; ``bax`` holds the mixed rows as bf16 words."""
     lane, wave = c.lane, c.wave
     n = min(4, c.rows - 4 * tile)
-    ab = wave - (1 + 2 * tile)
-    if (ab >= 0) & (ab < 2) & (lane < 16 * n):
+    ab = (wave + (WAVES - 1 - 2 * tile)) % WAVES
+    if (ab < 2) & (lane < 16 * n):
         q = lane % 16
         big = q < 8
         wrow = baw + (ab * RW_ROW + q * RW_PART)
-        xrow = bax + row_ix(q * RX_PART, 4 * tile + lane // 16, c.L.stride["bax"])
+        xrow = bax + row_ix(q * RW_PART, 4 * tile + lane // 16, c.L.stride["bax"])
         v4i = fx.Vector.make_type(4, fx.Int32)
         acc = fx.Float32(0.0)
         for k in range_constexpr(CHAIN_STEPS):
             wv = fx.Vector(fx.ptr_load(wrow + k * 4, result_type=v4i))
             w8 = bf16x8([wv[e] for e in range(4)])
-            x8 = lds_f4(xrow, k * 8) + lds_f4(xrow, k * 8 + 4)
+            xv = fx.Vector(fx.ptr_load(xrow + k * 4, result_type=v4i))
+            x8 = bf16x8([xv[e] for e in range(4)])
             new = acc
             for e in range_constexpr(8):
                 new = fma(w8[e], x8[e], new)
@@ -302,7 +297,45 @@ def _qk_norms(c, m):
 _qk_norms = ASTRewriter.transform(_qk_norms)
 
 
-def _b3(c, p, r0):
+def _b3_out(c, nw, t, vh, s, ek):
+    """Pass ``ek`` of B3's epilogue past ``WAVES`` rows: wave ``w`` runs
+    request row ``w + 8 ek``'s, as ``b3``'s wave ``r`` row ``r``'s."""
+    lane = c.lane
+    q = c.wave + WAVES * ek
+    rw = fx.min(q, c.rows - 1)
+    if q < c.rows:
+        cores_r, core_r, vz_r = [
+            lds_row(c, c.lds_f, n, rw) for n in ("cores", "core", "vz")
+        ]
+        got = mbx.poll([(c.mb_core, mb_ix(vh * 128 + 2 * lane, rw), 2)], c.tag)[0]
+        fx.ptr_store(got[0].bitcast(fx.Float32), cores_r + 2 * lane)
+        fx.ptr_store(got[1].bitcast(fx.Float32), cores_r + (2 * lane + 1))
+        tot = sumsq64(cores_r, lane) + sumsq64(cores_r + 64, lane)
+        inv_rms = rsq(tot * (1.0 / C.delta_v_dim) + C.eps)
+        r0 = (lane % 4) * 8
+        cv = lds_f4(core_r, r0) + lds_f4(core_r, r0 + 4)
+        zv = lds_f4(vz_r, 32 + r0) + lds_f4(vz_r, 32 + r0 + 4)
+        wv = bf16x8([nw[e] for e in range(4)])
+        out = [
+            bf16r(((cv[e] * inv_rms) * wv[e]) * sigmoid_fast(zv[e])) for e in range(8)
+        ]
+        amax = fmath.absf(out[0])
+        for e in range_constexpr(1, 8):
+            amax = fx.max(amax, fmath.absf(out[e]))
+        amax = xred(xred(amax, 1, fx.max), 2, fx.max)
+        ex, scale = p2.e8m0_fp8(amax)
+        lo = p2.fp8_word(out[0], out[1], out[2], out[3], scale)
+        hi = p2.fp8_word(out[4], out[5], out[6], out[7], scale)
+        if lane < 4:
+            mbx.put2(c.mb_d8, mb_ix(vh * 32 + s * 8 + lane * 2, rw), lo, hi, c.tag)
+        if lane == 0:
+            mbx.put(c.mb_de, mb_ix(t, rw), ex, c.tag)
+
+
+_b3_out = ASTRewriter.transform(_b3_out)
+
+
+def b3(c, p):
     tid, lane, wave = c.tid, c.lane, c.wave
     rows = c.rows
     t = task_index(c, "b3")
@@ -315,7 +348,7 @@ def _b3(c, p, r0):
     # up front as before.
     ptrs = {}
     for name in ("qk", "vz", "core", "cores", "sums", "baw", "bax"):
-        view = c.lds_i if name == "baw" else c.lds_f
+        view = c.lds_i if name in ("baw", "bax") else c.lds_f
         ptrs[name] = [
             lds_row(c, view, name, r) for r in range(1 if name == "baw" else rows)
         ]
@@ -377,11 +410,13 @@ def _b3(c, p, r0):
                     (c.mb_xbf, mb_ix(bj * 4 + 2, r), 2),
                 ]
             xv = mbx.poll(specs, c.tag)
-            for r in range_constexpr(rows):
-                _store_x(at("bax", r), xv[2 * r], 2 * bj)
-                _store_x(at("bax", r), xv[2 * r + 1], 2 * bj + 1)
             part, first = _part(bj * 8)
             off = part * RW_PART + (bj * 8 - first) // 2
+            for r in range_constexpr(rows):
+                words = [xv[2 * r][0], xv[2 * r][1], xv[2 * r + 1][0], xv[2 * r + 1][1]]
+                fx.ptr_store(
+                    fx.Vector.from_elements(words, fx.Int32), at("bax", r) + off
+                )
             fx.ptr_store(wb, baw + off)
             fx.ptr_store(wa, baw + (RW_ROW + off))
         gpu.barrier()
@@ -393,8 +428,8 @@ def _b3(c, p, r0):
         # chain on it.
         st, rec_out = [], []
         for r in range_constexpr(rows):
-            rec_in = delta_state(c, p, r0 + r)[2]
-            rec_out.append(delta_state(c, p, r0 + r)[3])
+            rec_in = delta_state(c, p, r)[2]
+            rec_out.append(delta_state(c, p, r)[3])
             if const_expr(r % c.group == 0):
                 st.append(
                     [
@@ -520,27 +555,8 @@ def _b3(c, p, r0):
                 mbx.put2(c.mb_d8, mb_ix(vh * 32 + s * 8 + lane * 2, rw), lo, hi, c.tag)
             if lane == 0:
                 mbx.put(c.mb_de, mb_ix(t, rw), ex, c.tag)
+        for ek in range_constexpr(1, -(-rows // WAVES)):
+            _b3_out(c, nw, t, vh, s, ek)
 
 
-_b3 = ASTRewriter.transform(_b3)
-
-
-B3_MAILBOXES = ("mb_qkvz", "mb_xbf", "mb_core", "mb_d8", "mb_de")
-
-
-def b3(c, p):
-    """B3 of request rows ``r0 ..``, in passes of ``c.L.b3_rows`` rows
-    (whole groups) past that: a pass after the first follows a CTA barrier
-    (its LDS rows are the last pass's), on fresh ids and mailbox addresses
-    (``common_wide.fresh_round``) moved ``r0`` rows on."""
-    if c.rows <= c.L.b3_rows:
-        _b3(c, p, 0)
-        return
-    for r0 in range(0, c.rows, c.L.b3_rows):
-        if r0:
-            gpu.barrier()
-        cp = fresh_round(c) if r0 else SimpleNamespace(**vars(c))
-        cp.rows = min(c.L.b3_rows, c.rows - r0)
-        for name in B3_MAILBOXES:
-            setattr(cp, name, getattr(cp, name) + r0 * SCRATCH_BYTES)
-        _b3(cp, p, r0)
+b3 = ASTRewriter.transform(b3)

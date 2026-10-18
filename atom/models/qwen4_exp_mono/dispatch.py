@@ -9,7 +9,8 @@ decode of up to ``MAX_ROWS`` rows, one token per request, with its QSA and PLE
 metadata built (the warmup and profiling forwards that run before the state
 pools exist have none). With MTP every decode step is a verify (k + 1 tokens
 per request); one of up to ``GROUPS`` requests is routed (``groups``). Every
-other forward, prefill and a wider verify included, is ATOM's own.
+other forward, prefill and a wider verify included, is ATOM's own. The decode
+steps' lm_head runs from MXFP4 (``head``).
 
 With MTP the drafter's model is wrapped too (``MonoDraftModel``): the draft
 steps of a routed verify run its decoder layer on mono (``draft_runner``),
@@ -29,6 +30,7 @@ from .config import MAX_ROWS, config_refusal
 from .draft_runner import Qwen4MonoDraftRunner
 from .group_runner import Qwen4MonoGroupRunner
 from .groups import group_draft_step_supported, group_step_supported
+from .head import install_fp4_head
 from .runner import Qwen4MonoDecodeRunner
 
 logger = logging.getLogger("atom")
@@ -205,6 +207,8 @@ def install_mono_decode(
     if why is not None:
         logger.info("Qwen3.8 mono decode off: %s", why)
         return model
+    # before the drafter's model is wrapped: it shares the target's lm_head
+    install_fp4_head(model, drafter)
     if drafter is not None and isinstance(getattr(drafter, "model", None), Qwen4ExpMTP):
         drafter.model = MonoDraftModel(drafter.model, atom_config, metadata_builder)
     # B3 reads and writes the recurrent state in place as VK; the caches are

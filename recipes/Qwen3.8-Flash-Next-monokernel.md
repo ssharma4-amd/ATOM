@@ -1,8 +1,8 @@
 # Qwen3.8-Flash-Next on the monokernel (TP1, MI355X)
 
 Qwen3.8-Flash-Next decodes on one MI355X (gfx950) with one FlyDSL kernel per decoder layer. The
-kernel runs MXFP4 weights and MXFP8 activations. Prefill, the embedding, the final mixer and `lm_head`
-stay ATOM's. The mono path serves:
+kernel runs MXFP4 weights and MXFP8 activations. Prefill and the final mixer stay ATOM's; a decode
+step's embedding is one launch and its `lm_head` runs from MXFP4 weights. The mono path serves:
 - decode steps of up to 4 requests;
 - MTP verify and draft steps with 1–3 draft tokens.
 

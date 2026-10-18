@@ -63,9 +63,11 @@ QSA_BLOCKS = 32768
 # M3 follows on CTAs whose C1 task ended early; M4's shared tasks (100-109)
 # and M5 share CTAs 0-9 and 156-159, in that order. Q4 sits on CTAs with no
 # Q5-Q7 task (those end at 73 and start at 128). P2 sits on CTAs without a
-# P1 task, so its loads go out at the kernel start.
+# P1 task, so its loads go out at the kernel start. A B3 task on an A2 CTA
+# starts its B1 only after the A2 task: A2 on CTAs 176-255 shares 16 with B3
+# (64 from 128: 0.3 µs a layer more).
 BASE = {
-    "a1": 0, "a2": 128, "b1": 0, "b3": 0, "c1": 192,
+    "a1": 0, "a2": 176, "b1": 0, "b3": 0, "c1": 192,
     "m1": 96, "m2": 110, "m3": 190, "m4": 156, "m5": 0,
     "q1": 0, "q2": 218, "q3": 0, "q4": 74, "q5": 128, "q6": 2, "q7": 26,
     "p1": 0, "p2": 160,
@@ -99,7 +101,9 @@ PAIR = 8
 # -> C1: the gated output's pack, in ``d8``/``de`` as B3's. P1 -> P2: bf16
 # words of PLE's key (4 streams) and value. P2 -> A1/A2/C1: the PLE output
 # ``h'`` (the attention HC's streams and C1's residual) and its 16-column
-# square sums, laid out as ``w`` and ``whs``.
+# square sums, laid out as ``w`` and ``whs``. A1 -> A2 (``inv``) and M1 -> M2
+# (``minv``), from ``hc.INV_ROWS`` rows: the inverse RMS of the 4 streams
+# (f32), from each row's task 0.
 REGIONS = {
     "lr8": C.hc_lowrank // 4,
     "lre": C.hc_lowrank // 32,
@@ -135,6 +139,8 @@ REGIONS = {
     "pv": C.hidden // 2,
     "ph": C.hc_width // 2,
     "phs": C.hc_count * TASKS["c1"],
+    "inv": C.hc_count,
+    "minv": C.hc_count,
 }
 DN_ROW = C.moe_inter // 4 + C.moe_inter // 32  # 180 pairs: 160 fp8 words, 20 exponents
 
@@ -231,7 +237,7 @@ _QSA = (
     ),  # Q3: the normalized, rotated index query (f32)
     (
         "q4_keys",
-        2560,
+        5120,
     ),  # Q4: radix histograms, wave counts, candidates (qsa_fast.LDS_WORDS)
 )
 
@@ -333,8 +339,9 @@ def for_rows(rows, seq=False):
     """The layout of a build serving ``rows`` requests: ``tasks``, ``base``
     (as :data:`TASKS`, :data:`BASE`), ``lds``, ``stride`` (row ``r`` of a
     per-row LDS entry sits ``r * stride[name]`` words past ``lds[name]``) and
-    ``lds_words``, ``split`` (the ``_ATTN`` split, :data:`SPLIT_GROUPS`) and
-    ``m4_slices`` (64-column slices per M4 task). One request is exactly the
+    ``lds_words``, ``split`` (the ``_ATTN`` split, :data:`SPLIT_GROUPS`),
+    ``m4_slices`` (64-column slices per M4 task) and ``m3_task_rows``
+    (request rows per M3 task). One request is exactly the
     module-level layout. ``seq``: the rows are consecutive tokens of one
     request (an MTP verify build), which only grows two LDS entries
     (:data:`SEQ_GROW`)."""
@@ -343,7 +350,7 @@ def for_rows(rows, seq=False):
     if rows == 1:
         return SimpleNamespace(
             rows=1, tasks=TASKS, base=BASE, lds=LDS, stride=STRIDE, lds_words=LDS_WORDS,
-            split=False, m4_slices=1, seq=False,
+            split=False, m4_slices=1, seq=False, m3_task_rows=1,
         )  # fmt: skip
     tasks, base = dict(TASKS), dict(BASE)
     # A1/M1: every request row's one-request tasks. M2 then M3 follow M1's
@@ -352,6 +359,15 @@ def for_rows(rows, seq=False):
         tasks[name] = rows * TASKS[name]
     base["m2"] = base["m1"] + tasks["m1"]
     base["m3"] = (base["m2"] + tasks["m2"]) % GRID
+    # M3: each router block's rows in parts, as few rows a task as fit the
+    # grid (one at 2 and 3 rows, two at 4: 130, 195, 130 tasks).
+    fit = (
+        d
+        for d in range(1, rows + 1)
+        if rows % d == 0 and rows // d * TASKS["m3"] <= GRID
+    )
+    m3_task_rows = next(fit)
+    tasks["m3"] = rows // m3_task_rows * TASKS["m3"]
     # M4: every row's routed tasks, then the shared expert's (all rows at once);
     # two slices per task where one per task would not fit the grid.
     m4_slices = 1 if (rows * C.top_k + 1) * (C.moe_inter // 64) <= GRID else 2
@@ -373,7 +389,7 @@ def for_rows(rows, seq=False):
     assert words <= LDS_LIMIT, words
     return SimpleNamespace(
         rows=rows, tasks=tasks, base=base, lds=lds, stride=stride, lds_words=words, split=split,
-        m4_slices=m4_slices, seq=seq,
+        m4_slices=m4_slices, seq=seq, m3_task_rows=m3_task_rows,
     )  # fmt: skip
 
 

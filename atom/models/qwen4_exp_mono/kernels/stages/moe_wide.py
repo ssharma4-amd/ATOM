@@ -1,15 +1,18 @@
 """Wide builds' M3-M5 (``layout_wide.for_wide``): moe.py's stages with
 every request row's MFMA result taken from its lanes (``common_wide``):
 
-- M3 runs its router chains 4 request rows at a time, past ``m3_rows``
-  rows (``layout_wide``) in passes of ``m3_rows`` request rows.
+- M3 runs a router block's request rows (an even count) in halves on two CTAs
+  (``layout_wide``'s ``m3_task_rows``), its router chains 4 request rows at
+  a time, past ``m3_rows`` rows in passes of ``m3_rows`` request rows.
 - M4 (two slices per task) fills the shared expert's LDS rows on waves
   ``0 .. rows - 1`` (past ``WAVES`` rows in passes, :func:`_m4_fill`) and runs
   its epilogue's rows ``ws``, ``ws + 4``, ... on wave ``ws`` of each slice.
 - M5's routing past ``WAVES`` rows: in passes (:func:`_m5_pre_route`,
   :func:`_m5_own_route`).
 - M5 streams each wave's ``ceil((10 rows + 1) / 8)`` down chains with
-  :data:`M5_INFLIGHT` units of weights in flight.
+  :data:`M5_INFLIGHT` units of weights in flight, and polls its rows in
+  blocks (:func:`_m5_blocks`): on the CTAs past M4's last partial round
+  (``layout_wide``), a block's chains run once M4's earlier rounds end.
 
 Derived from moe.py; moe.py stays the source.
 """
@@ -33,6 +36,7 @@ from atom.models.qwen4_exp_mono.kernels.layout import (
     RX_PART,
     WAVES,
 )
+from atom.models.qwen4_exp_mono.kernels.layout_wide import M5_BLOCK, WIDE_ROWS
 from atom.models.qwen4_exp_mono.kernels.stages.common import (
     HC_WORDS,
     bf16r,
@@ -94,6 +98,12 @@ from atom.models.qwen4_exp_mono.kernels.stages.moe import (
 )
 
 M5_INFLIGHT = 5  # M5's down-weight units in flight per wave
+M5_PF_STEPS = 3  # M5: chain steps from a poll block's prefetch to its first chain
+M5_ROUTED_LOADS = C.top_k * DN_ROW // 2  # 2-pair loads of a row's routed ranks
+# M5's poll-block votes: words of ``top``'s row 0 that the routing leaves free.
+TOP_VOTE = TOP_IDS + C.top_k
+M5_VOTES = WIDE_ROWS // M5_BLOCK
+assert TOP_VOTE + M5_VOTES <= TOP_M4
 
 
 def _m3_chains(c, rw, rx, lgl, tile, q0, rows):
@@ -133,9 +143,13 @@ _m3_chains = ASTRewriter.transform(_m3_chains)
 
 def m3(c, p):
     tid = c.tid
-    rows = c.rows
-    t = task_index(c, "m3")
     experts = c.experts
+    # Wide builds: task ``task`` runs router block ``t`` (``moe.m3``'s task)
+    # for request rows ``h0 .. h0 + rows - 1``, a half of the rows when even
+    # (``layout_wide``).
+    task = task_index(c, "m3")
+    rows = c.L.m3_task_rows
+    t, h0 = task % (experts // 8 + 1), task // (experts // 8 + 1) * rows
     rw = c.lds_i + c.L.lds["rw"]
     rx = c.lds_f + c.L.lds["rx"]
     lgl = c.lds_f + c.L.lds["lgl"]
@@ -145,9 +159,9 @@ def m3(c, p):
     # Batched builds: hint ``m`` is M2 task ``m % 80`` of request row ``m // 80``.
     def hint(m):
         k, r = (m, 0) if rows == 1 else (m % (C.hidden // 32), m // (C.hidden // 32))
-        return c.mb_mxe, mb_ix(k, r)
+        return c.mb_mxe, mb_ix(k, h0 + r)
 
-    if t <= experts // 8:
+    if task < (experts // 8 + 1) * (c.rows // rows):
         # Chunk ``j``: 8 bf16 of row ``j // 320``; the gate task reads row E 8 times.
         ws = []
         for m in range_constexpr(RW_LOADS):
@@ -158,14 +172,14 @@ def m3(c, p):
 
         pre_poll_wide(hint, C.hidden // 32 * rows, c.tag)
         hi = fx.min(tid + THREADS, RX_LOADS - 1)
-        # Wide builds: request rows ``q0 ..`` (``m3_rows`` a pass) through LDS
-        # rows ``0 ..`` of ``rx``; the router weights in the first pass.
+        # Wide builds: the task's rows ``q0 ..`` (``m3_rows`` a pass) through
+        # LDS rows ``0 ..`` of ``rx``; the router weights in the first pass.
         for qp in range_constexpr(-(-rows // c.L.m3_rows)):
             q0 = qp * c.L.m3_rows
             n = min(c.L.m3_rows, rows - q0)
             v = mbx.poll(
                 [
-                    (c.mb_mxbf, mb_ix(j * 2, q0 + r), 2)
+                    (c.mb_mxbf, mb_ix(j * 2, h0 + q0 + r), 2)
                     for r in range(n)
                     for j in (tid, hi)
                 ],
@@ -192,13 +206,13 @@ def m3(c, p):
                 _m3_chains(c, rw, rx, lgl, k, q0, n)
             gpu.barrier()
 
-        # Thread ``2 r + i``: logits ``8 t + 4 i ..`` of request row ``r``.
+        # Thread ``2 r + i``: logits ``8 t + 4 i ..`` of request row ``h0 + r``.
         li, lr = (tid, 0) if rows == 1 else (tid % 2, tid // 2)
         if (t < experts // 8) & (tid < 2 * rows):
             lg = lds_f4(lgl, row_ix(li * 4, lr, slg))
             mbx.put2(
                 c.mb_lg,
-                mb_ix(t * 4 + li * 2, lr),
+                mb_ix(t * 4 + li * 2, h0 + lr),
                 mbx.bf16_pair(lg[0], lg[1]),
                 mbx.bf16_pair(lg[2], lg[3]),
                 c.tag,
@@ -207,7 +221,7 @@ def m3(c, p):
             gl = lgl if rows == 1 else lgl + tid * slg
             mbx.put(
                 c.mb_sg,
-                0 if rows == 1 else mb_ix(0, tid),
+                0 if rows == 1 else mb_ix(0, h0 + tid),
                 bf16r(sigmoid_acc(fx.ptr_load(gl))),
                 c.tag,
             )
@@ -488,6 +502,123 @@ def _m5_own_route(c, t, m5_only, ek):
 _m5_own_route = ASTRewriter.transform(_m5_own_route)
 
 
+def _m5_blocks(rows, block):
+    """M5's poll blocks of ``block`` request rows (``layout_wide.M5_BLOCK``,
+    else one block): (first row, end row, last) of each, the last also every
+    row's shared rank; and the chain step (:func:`_m5_chain`) that first reads
+    each. A row block's routed ranks come from M4 tasks of the earlier rounds,
+    every shared rank from the last round's last tasks."""
+    n = C.top_k * rows
+    nb = -(-rows // block)
+    blocks = [(b * block, min(b * block + block, rows), b == nb - 1) for b in range(nb)]
+    first = [None] * nb
+    for s in range(-(-(n + 1) // WAVES)):
+        hi = min(WAVES * s + WAVES - 1, n)
+        need = nb - 1 if hi == n else hi // C.top_k // block
+        for b in range(need + 1):
+            if first[b] is None:
+                first[b] = s
+    return blocks, first
+
+
+def _m5_loads(blk):
+    """(per-row 2-pair loads of rows ``r0 ..``, loads of the earlier rows'
+    shared ranks) of poll block ``blk``."""
+    r0, _, last = blk
+    return (DN_LOADS if last else M5_ROUTED_LOADS), (DN_ROW // 2 * r0 if last else 0)
+
+
+def _m5_specs(c, blk):
+    """Poll block ``blk``'s payload loads of this thread: pairs ``2 tid`` and
+    ``2 hi`` of each of its rows, then its share of the earlier rows' shared
+    ranks."""
+    r0, r1, _ = blk
+    tid = c.tid
+    n, ns = _m5_loads(blk)
+    hi = fx.min(tid + THREADS, n - 1)
+    specs = [(c.mb_dn, mb_ix(j * 2, r), 2) for r in range(r0, r1) for j in (tid, hi)]
+    for i in range(-(-ns // THREADS)):
+        m = fx.min(tid + THREADS * i, ns - 1)
+        j = M5_ROUTED_LOADS + m % (DN_ROW // 2)
+        specs.append((c.mb_dn, mb_ix(j * 2, m // (DN_ROW // 2)), 2))
+    return specs
+
+
+def _m5_hint(c, blk, m):
+    """Hint ``m`` of poll block ``blk``: the M4 exponent pairs of its rows'
+    ranks, then (the last block) of the earlier rows' shared ranks."""
+    r0, r1, last = blk
+    nk = (C.top_k + 1 if last else C.top_k) * GU_TILES
+    k, r = m % nk, m // nk
+    if r0:
+        r = r + r0
+        if last:
+            q = m - nk * (r1 - r0)
+            own = q < 0
+            k = own.select(k, C.top_k * GU_TILES + q % GU_TILES)
+            r = own.select(r, q // GU_TILES)
+    return c.mb_dn, mb_ix((k // GU_TILES) * DN_ROW + DN_X8 + (k % GU_TILES) * 2, r)
+
+
+def _m5_hints(blk):
+    r0, r1, last = blk
+    return (C.top_k + 1 if last else C.top_k) * GU_TILES * (
+        r1 - r0
+    ) + GU_TILES * r0 * last
+
+
+def _m5_store(c, dn, blk, v):
+    """Store poll block ``blk``'s payload ``v`` (one list of words per
+    :func:`_m5_specs` load) into LDS."""
+    r0, r1, _ = blk
+    tid, sdn = c.tid, c.L.stride["dn"]
+    n, ns = _m5_loads(blk)
+    hi = fx.min(tid + THREADS, n - 1)
+    for r in range_constexpr(r0, r1):
+        i = 2 * (r - r0)
+        fx.ptr_store(
+            fx.Vector.from_elements(v[i], fx.Int32), dn + row_ix(tid * 2, r, sdn)
+        )
+        if tid + THREADS < n:
+            fx.ptr_store(
+                fx.Vector.from_elements(v[i + 1], fx.Int32), dn + row_ix(hi * 2, r, sdn)
+            )
+    for i in range_constexpr(-(-ns // THREADS)):
+        m = fx.min(tid + THREADS * i, ns - 1)
+        j = M5_ROUTED_LOADS + m % (DN_ROW // 2)
+        dst = dn + row_ix(j * 2, m // (DN_ROW // 2), sdn)
+        fx.ptr_store(fx.Vector.from_elements(v[2 * (r1 - r0) + i], fx.Int32), dst)
+
+
+_m5_store = ASTRewriter.transform(_m5_store)
+
+
+def _m5_poll_block(c, dn, blk):
+    """Poll block ``blk`` into LDS: wave 0 waits on its hints, then every
+    thread polls its payload loads."""
+    pre_poll_wide(lambda m: _m5_hint(c, blk, m), _m5_hints(blk), c.tag)
+    _m5_store(c, dn, blk, mbx.poll(_m5_specs(c, blk), c.tag))
+    gpu.barrier()
+
+
+def _m5_take(c, dn, top, blk, b, v):
+    """Poll block ``blk`` (``b``) from its prefetch ``v`` (one load each,
+    ``M5_PF_STEPS`` chain steps ahead): store it, and the CTA votes whether
+    any load came early (``TOP_VOTE + b``); if one did, poll the block again.
+    The prefetch keeps the weight units issued after it in flight (a poll's
+    loads would wait for them)."""
+    specs = _m5_specs(c, blk)
+    _m5_store(c, dn, blk, mbx.split_values(v, specs))
+    if mbx.pending(v, c.tag):
+        fx.ptr_store(fx.Int32(1), top + (TOP_VOTE + b))
+    gpu.barrier()
+    if uniform(fx.ptr_load(top + (TOP_VOTE + b))) != 0:
+        _m5_poll_block(c, dn, blk)
+
+
+_m5_take = ASTRewriter.transform(_m5_take)
+
+
 def m5(c, p):
     tid, lane, wave = c.tid, c.lane, c.wave
     rows = c.rows
@@ -496,7 +627,7 @@ def m5(c, p):
     topf = c.lds_f + c.L.lds["top"]
     dn = c.lds_i + c.L.lds["dn"]
     ys = c.lds_f + c.L.lds["ys"]
-    stop, sdn, sys_ = c.L.stride["top"], c.L.stride["dn"], c.L.stride["ys"]
+    stop, sys_ = c.L.stride["top"], c.L.stride["ys"]
     nu = -(-(C.top_k * rows + 1) // WAVES)  # chains per wave (:func:`_m5_chain`)
 
     # Batched builds: hint ``m`` is M4 exponent pair ``m % 110`` of request row ``m // 110``.
@@ -518,6 +649,9 @@ def m5(c, p):
                 _m5_route(c, t, fx.min(wave, rows - 1))
             for ek in range_constexpr(1, -(-rows // WAVES)):
                 _m5_own_route(c, t, m5_only, ek)
+            if const_expr(c.L.m5_block < rows):
+                if tid < M5_VOTES:
+                    fx.ptr_store(fx.Int32(0), top + (TOP_VOTE + tid))
         gpu.barrier()
 
         # Issue the down weights once M4's first routed tile is out. Issued
@@ -564,24 +698,10 @@ def m5(c, p):
         else:
             units = [_m5_issue(c, p, t, top, s) for s in range(min(M5_INFLIGHT, nu))]
 
-        # The exponent pair is each M4 task's last store.
-        pre_poll_wide(hint, (C.top_k + 1) * GU_TILES * rows, c.tag)
-        hi = fx.min(tid + THREADS, DN_LOADS - 1)
-        v = mbx.poll(
-            [(c.mb_dn, mb_ix(j * 2, r), 2) for r in range(rows) for j in (tid, hi)],
-            c.tag,
-        )
-        for r in range_constexpr(rows):
-            fx.ptr_store(
-                fx.Vector.from_elements(v[2 * r], fx.Int32),
-                dn + row_ix(tid * 2, r, sdn),
-            )
-            if tid + THREADS < DN_LOADS:
-                fx.ptr_store(
-                    fx.Vector.from_elements(v[2 * r + 1], fx.Int32),
-                    dn + row_ix(hi * 2, r, sdn),
-                )
-        gpu.barrier()
+        # The exponent pair is each M4 task's last store. The rows in poll
+        # blocks (:func:`_m5_blocks`): the first now, the others in the chains.
+        blocks, first = _m5_blocks(rows, c.L.m5_block)
+        _m5_poll_block(c, dn, blocks[0])
 
         if const_expr(rows == 1):
             acc = _dn_chain(unit_a, dn + wave * DN_ROW, lane)
@@ -605,9 +725,15 @@ def m5(c, p):
                     shared = bf16r(((w0[0] + w1[0]) + w2[0]) + w3[0])
                     fx.ptr_store(shared, ys + (C.top_k * 16 + lane))
         else:
+            pf = [None] * len(blocks)
             for s in range_constexpr(nu):
                 if const_expr(s + M5_INFLIGHT < nu):
                     units.append(_m5_issue(c, p, t, top, s + M5_INFLIGHT))
+                for b in range_constexpr(1, len(blocks)):
+                    if const_expr(s == first[b]):
+                        _m5_take(c, dn, top, blocks[b], b, pf[b])
+                    if const_expr(s == max(first[b] - M5_PF_STEPS, first[b - 1])):
+                        pf[b] = mbx.load_pairs(_m5_specs(c, blocks[b]))
                 _m5_chain(c, units[s], s, dn, ys)
         gpu.barrier()
 

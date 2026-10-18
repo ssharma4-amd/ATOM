@@ -420,12 +420,13 @@ def _now_rows(p, r_pg, L, seq):
     return tail, 4 * tail + L % 4
 
 
-def _q5(c, p, tid, t):
+def _q5(c, p, tid, t, turn):
     qs = c.lds_i + c.L.lds["q5_q"]
     ks = c.lds_i + c.L.lds["q5_k"]
     sl = c.lds_i + c.L.lds["q5_sel"]
-    # Batched builds: tasks (tile, request row, kv head), tile-major.
-    rq = 0 if c.rows == 1 else (t // 2) % c.rows
+    # Batched builds: tasks (tile, request row, kv head), tile-major, the
+    # rows turned ``turn`` on (``q5``).
+    rq = 0 if c.rows == 1 else (t // 2 + turn) % c.rows
     L = row_len(p, rq)
     a_pages = qsa_row(p, rq, "pages")
     a_key = qsa_row(p, rq, "key")
@@ -547,8 +548,14 @@ _q5 = ASTRewriter.transform(_q5)
 def q5(c, p):
     tid = fx.Int32(c.tid)
     t = task_index(c, "q5")
+    # A CTA's rounds run tasks GRID apart: where 2 rows divides GRID, all of
+    # one request row, so a long request's tiles would fall on the same CTAs
+    # every round. Round k turns the rows k on instead (a tile's tasks lie in
+    # one round, so the turn permutes its rows). A seq build's rows are one
+    # request's.
+    turn = 0 if c.seq or GRID % (2 * c.rows) else 1
     for k in range_constexpr(task_rounds(c, "q5")):
-        _q5(c, p, tid, t if k == 0 else t + k * GRID)
+        _q5(c, p, tid, t if k == 0 else t + k * GRID, k * turn % c.rows)
 
 
 def q6(c, p):

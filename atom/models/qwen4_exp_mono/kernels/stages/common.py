@@ -21,7 +21,7 @@ from atom.models.qwen4_exp_mono.kernels import p2
 from atom.models.qwen4_exp_mono.kernels.config import DEFAULT as C
 from atom.models.qwen4_exp_mono.kernels.config import GRID
 from atom.models.qwen4_exp_mono.kernels.device_ops import exp, rcp, rsrc, xred
-from atom.models.qwen4_exp_mono.kernels.layout import ROW_PAIRS
+from atom.models.qwen4_exp_mono.kernels.layout import MAX_ROWS, ROW_PAIRS
 
 LN2 = 0.6931471805599453
 
@@ -233,6 +233,19 @@ def mfma_operands(c, x8, xe, x8_name="x8", xe_name="xe"):
         return x8, xe
     r = mfma_row(c)
     return x8 + r * c.L.stride[x8_name], xe + r * c.L.stride[xe_name]
+
+
+def payload_wait(c, hint, n):
+    """The wait ahead of a payload poll whose producers end with the hint
+    pairs ``hint`` (``n`` of them, as :func:`mbx.pre_poll`). Builds of up to
+    ``MAX_ROWS`` rows only barrier: the payload poll spins itself, one round
+    trip after the producers' stores instead of the hint's two. Wider builds
+    keep the pre-poll's throttle (their payload polls hold more pairs per
+    thread, on more CTAs). Every thread must call this."""
+    if c.L.rows <= MAX_ROWS:
+        gpu.barrier()
+    else:
+        mbx.pre_poll(hint, n, c.tag)
 
 
 def poll_mixed(c, x8, xe):

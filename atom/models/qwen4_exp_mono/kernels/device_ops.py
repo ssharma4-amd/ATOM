@@ -36,6 +36,16 @@ def uniform(value):
     return fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(value).ir_value()))
 
 
+def opaque(value):
+    """Wave-uniform ``value`` through an ``s_mov`` the compiler cannot see
+    through: the result is not reused from, nor computed before, another."""
+    v = as_ir_value(fx.Int32(value))
+    asm = llvm.InlineAsmOp(
+        T.i32, [v], "s_mov_b32 $0, $1", "=s,s", has_side_effects=True
+    )
+    return fx.Int32(asm.result)
+
+
 def spin_pause() -> None:
     """Keep tagged-mailbox polling loads inside the retry loop."""
 

@@ -11,9 +11,11 @@ phase's entries start at word 0 and overlay every other phase's, and the
 kernel runs a CTA barrier ahead of a stage whose phase is not the last one's
 (:func:`barrier_before`).
 
-Past ``WAVES`` rows (one request row per wave) B3 runs in passes of whole
-groups, ``b3_rows`` rows at most, and M3 in passes of ``m3_rows`` rows; their
-LDS entries hold one pass's rows. A1's norm pack (``n8``, ``ne``) is of one
+M3 runs each router block's request rows in halves (an even row count) on
+two CTAs, ``m3_task_rows`` rows a task. B3 holds every row's mixed row as
+bf16 words (``bax``, as ``baw``), so all rows fit one pass. Past ``WAVES``
+rows (one request row per wave) M3's tasks run in passes of ``m3_rows`` rows;
+its LDS entries hold one pass's rows. A1's norm pack (``n8``, ``ne``) is of one
 row. At 16 rows M4's and M5's entries are two phases, both after ``top``
 (M4's CTAs route M5's rows into it ahead).
 """
@@ -35,6 +37,7 @@ from atom.models.qwen4_exp_mono.kernels.layout import (
     LDS_LIMIT,
     MAX_ROWS,
     ROUNDS,
+    RW_ROW,
     SEQ_GROW,
     TASKS,
     WAVES,
@@ -44,6 +47,8 @@ from atom.models.qwen4_exp_mono.kernels.layout import (
 WIDE_ROWS = 16
 # Two 64-column slices per M4 task: one per task would not fit the grid.
 M4_SLICES = 2
+# M5's poll blocks (``moe_wide._m5_blocks``): request rows per block.
+M5_BLOCK = 4
 
 # The LDS phase of each stage; Q2 holds no LDS. B1, C1 and Q1 share the GEMV
 # entries (``red``, ``x8``, ``xe``), B3 has the rest of the DeltaNet table.
@@ -64,7 +69,8 @@ def _phases(group):
     return {
         "hc": _HC_TABLE,
         "d1": _DELTA_TABLE[:3],
-        "d3": _DELTA_TABLE[3:],
+        # B3's mixed row by part as bf16 words (``delta_group_wide.b3``).
+        "d3": tuple((n, RW_ROW if n == "bax" else w) for n, w in _DELTA_TABLE[3:]),
         "m3": _MOE[:3],
         "m45": tuple((n, w * M4_SLICES if n == "gred" else w) for n, w in _MOE[3:]),
         "q34": _QSA,
@@ -108,11 +114,23 @@ def for_wide(rows, group):
     # The task counts of ``for_rows``. M1's and M2's CTAs wrap past the
     # grid's end.
     tasks, base = dict(TASKS), dict(BASE)
+    # A2 from CTA 128: the narrow builds' 176 was measured up to 4 rows only.
+    base["a2"] = 128
     for name in ("a1", "m1"):
         tasks[name] = rows * TASKS[name]
     base["m2"] = (base["m1"] + tasks["m1"]) % GRID
     base["m3"] = (base["m2"] + tasks["m2"]) % GRID
+    m3_task_rows = rows // 2 if rows % 2 == 0 else rows
+    tasks["m3"] = rows // m3_task_rows * TASKS["m3"]
     tasks["m4"] = (rows * C.top_k + 1) * (C.moe_inter // 64 // M4_SLICES)
+    # M5 on the CTAs past M4's last partial round when it fits there: those
+    # end M4 a round early and poll M5's rows in blocks of ``M5_BLOCK`` as
+    # M4's rounds complete them. Else one block of all rows.
+    m4_rem = tasks["m4"] % GRID
+    m5_block = rows
+    if m4_rem and tasks["m5"] <= GRID - m4_rem:
+        base["m5"] = (base["m4"] + m4_rem) % GRID
+        m5_block = M5_BLOCK
     tasks["q3"] = rows * (GRID // rows)
     for name in ("q4", "q5", "q6", "q7", "p2"):
         tasks[name] = rows * TASKS[name]
@@ -122,11 +140,10 @@ def for_wide(rows, group):
     rounds = (*ROUNDS, "q6") if deep else ROUNDS
     for name, n in tasks.items():
         assert n <= GRID or name in rounds, f"{name}: one task per CTA at most"
-    # B3's and M3's passes, A1's one norm-packed row.
-    b3_rows = WAVES // group * group if deep else rows
-    m3_rows = WAVES if deep else rows
+    # M3's passes, A1's one norm-packed row.
+    m3_rows = min(WAVES, m3_task_rows)
     n_of = {"n8": 1, "ne": 1} if deep else {}
-    n_of |= {n: b3_rows for n, _ in _DELTA_TABLE[3:]} | {"rx": m3_rows}
+    n_of |= {"rx": m3_rows}
     tables, phase = _phases(group), dict(PHASE)
     if _place({}, {}, tables["m45"], rows, n_of) > LDS_LIMIT:
         m45 = tables.pop("m45")
@@ -141,5 +158,6 @@ def for_wide(rows, group):
     return SimpleNamespace(
         rows=rows, tasks=tasks, base=base, lds=lds, stride=stride,
         lds_words=max(sizes.values()), split=False, m4_slices=M4_SLICES, seq=True,
-        group=group, phases=sizes, phase=phase, b3_rows=b3_rows, m3_rows=m3_rows,
+        group=group, phases=sizes, phase=phase, m3_rows=m3_rows,
+        m3_task_rows=m3_task_rows, m5_block=m5_block,
     )  # fmt: skip

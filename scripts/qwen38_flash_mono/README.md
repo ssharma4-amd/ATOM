@@ -6,7 +6,8 @@ server, on the same MXFP4 checkpoint:
 - **Default path:** ATOM's own model (`atom/models/qwen4_exp.py`), one kernel per op: ATOM's Triton
   GEMM, GatedDeltaNet and QSA kernels, aiter's FlyDSL MoE, norms and `lm_head` GEMM.
 - **Mono path:** the same model, but each decoder layer's decode step is one FlyDSL kernel
-  (`atom/models/qwen4_exp_mono`). Prefill, the embedding, the final mixer and `lm_head` stay ATOM's.
+  (`atom/models/qwen4_exp_mono`). Prefill and the final mixer stay ATOM's; a decode step's
+  embedding is one launch and its `lm_head` runs from MXFP4 weights.
 
 ## The monokernel
 
@@ -44,6 +45,10 @@ so we gave the default path the same MXFP4 checkpoint and numerics:
    - The MoE runs MXFP4 weights on MXFP8 activations with aiter's FlyDSL kernels (`qwen4_exp.py`).
    - The dense linears run W4A8 through ATOM's existing W4A8 group-32 linear (`atom/quant_spec.py`).
      ATOM's default for Quark MXFP4 is FP4 activations, which lost 3.3 GSM8K points against FP8.
+   - Fewer launches and host stalls a step (`hyperconnection.py`, `ops/qsa.py`, `qwen4_exp_attn.py`):
+     the final hyper-connection mix runs the two fused kernels up to 8 rows, a draft step advances its
+     lengths and positions inside its QSA metadata launch, and the accepted-token counts reach the GPU
+     in one copy from pinned memory.
 3. **The mono path,** `atom/models/qwen4_exp_mono`, is routed by `ATOM_MONO_ENABLE` (on by
    default). A deployment it does not serve logs the reason once and runs the default path.
 4. **`ATOM_RUNNER_INLINE_SEND=1`** (new, both paths). ATOM's model runner sends each step's output
