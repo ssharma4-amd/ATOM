@@ -269,12 +269,12 @@ def test_iq2r_glm53_packed_v2_create_weights_at_tp4(aiter_iq2r):
     assert tuple(layer.w13_weight.shape) == (257, iq2r_glm53_gate_bytes(1024))
     assert tuple(layer.w13_weight_scale.shape) == (
         257,
-        iq2r_glm53_v2_aux_bytes(1024, 6144, 2, 4),
+        iq2r_glm53_v2_aux_bytes(1024, 6144, 4, gate=True),
     )
     assert tuple(layer.w2_weight.shape) == (257, down.data_bytes)
     assert tuple(layer.w2_weight_scale.shape) == (
         257,
-        iq2r_glm53_v2_aux_bytes(6144, 512, 1, 4),
+        iq2r_glm53_v2_aux_bytes(6144, 512, 4, gate=False),
     )
 
 
@@ -301,9 +301,9 @@ def test_iq2r_glm53_packed_v2_loader_slices_the_rank_shard(
 
     weights = {
         "w13_weight": full(iq2r_glm53_gate_bytes(4096)),
-        "w13_weight_scale": full(iq2r_glm53_v2_aux_bytes(4096, 6144, 2, 4)),
+        "w13_weight_scale": full(iq2r_glm53_v2_aux_bytes(4096, 6144, 4, gate=True)),
         "w2_weight": full(down.data_bytes),
-        "w2_weight_scale": full(iq2r_glm53_v2_aux_bytes(6144, 2048, 1, 4)),
+        "w2_weight_scale": full(iq2r_glm53_v2_aux_bytes(6144, 2048, 4, gate=False)),
     }
     start = 2 * shard * tp_rank
     expected = {
@@ -320,10 +320,10 @@ def test_iq2r_glm53_packed_v2_loader_slices_the_rank_shard(
     }
     for name, value in expected.items():
         assert value.shape[1] == (
-            iq2r_glm53_v2_aux_bytes(2 * shard, 6144, 2, 4)
+            iq2r_glm53_v2_aux_bytes(2 * shard, 6144, 4, gate=True)
             if name == "w13_weight_scale"
             else (
-                iq2r_glm53_v2_aux_bytes(6144, shard, 1, 4)
+                iq2r_glm53_v2_aux_bytes(6144, shard, 4, gate=False)
                 if name == "w2_weight_scale"
                 else value.shape[1]
             )

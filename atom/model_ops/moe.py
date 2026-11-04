@@ -998,10 +998,13 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
 
             self.v2_classes = IQ2R_V2_LEVELS_C4.classes
             shapes["w13_weight_scale"] = iq2r_glm53_v2_aux_bytes(
-                gate_metadata.logical_n, hidden_size, 2, self.v2_classes
+                gate_metadata.logical_n, hidden_size, self.v2_classes, gate=True
             )
             shapes["w2_weight_scale"] = iq2r_glm53_v2_aux_bytes(
-                hidden_size, intermediate_size_per_partition, 1, self.v2_classes
+                hidden_size,
+                intermediate_size_per_partition,
+                self.v2_classes,
+                gate=False,
             )
         tensors = {
             name: torch.empty((num_experts, nbytes), dtype=torch.uint8)
