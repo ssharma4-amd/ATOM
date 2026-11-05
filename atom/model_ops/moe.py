@@ -919,11 +919,12 @@ _IQ2R_GLM53_TILE_N = 128
 
 
 class Iq2rMoEMethod(FusedMoEMethodBase):
-    """AITER IQ2R experts in the ``glm53-packed-v1`` layout.
+    """AITER IQ2R experts in the ``glm53-packed-v1``/``-v2`` layouts.
 
-    The layout covers GLM-5.3 with the shared expert fused as expert 256, at
-    TP4/TP8. The checkpoint holds full layers; each rank slices its share of
-    the intermediate dimension as it loads.
+    The layouts cover GLM-5.3 at TP4/TP8. In v1 the shared expert is fused as
+    expert 256; v2 checkpoints keep it FP8, so it runs unfused and the MoE has
+    the 256 routed experts. The checkpoint holds full layers; each rank slices
+    its share of the intermediate dimension as it loads.
     """
 
     v2 = False
@@ -958,15 +959,16 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         # The layout fixes the model shapes and load_weight checks every
         # buffer against them, so only the parallel setup is checked here.
         parallel = self.moe.moe_parallel_config
+        fused_shared = 0 if self.v2 else 1
         if (
             parallel.tp_size not in (4, 8)
             or parallel.ep_size != 1
             or layer.has_bias
-            or layer.num_fused_shared_experts != 1
+            or layer.num_fused_shared_experts != fused_shared
         ):
             raise NotImplementedError(
-                "the glm53-packed-v1 IQ2R layout runs at TP4/TP8 without EP, "
-                "with the shared expert fused"
+                "the GLM-5.3 IQ2R layouts run at TP4/TP8 without EP, with the "
+                "shared expert fused (v1) or FP8 outside the MoE (v2)"
             )
         self.tp_size = parallel.tp_size
         self.tp_rank = parallel.tp_rank

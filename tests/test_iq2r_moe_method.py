@@ -80,7 +80,8 @@ def test_iq2r_rejects_unknown_layout(layout):
 def _glm53_packed_layer(method, device="meta"):
     layer = torch.nn.Module()
     layer.has_bias = False
-    layer.num_fused_shared_experts = 1
+    # v2 checkpoints keep the shared expert FP8, outside the MoE.
+    layer.num_fused_shared_experts = 0 if method.v2 else 1
     with torch.device(device):
         method.create_weights(
             layer,
@@ -177,19 +178,26 @@ def test_glm53_weights_mapping_targets_every_compiled_tensor(aiter_iq2r):
 
 
 @pytest.mark.parametrize(
-    "tp_size,ep_size,fused_shared",
-    [(2, 1, 1), (1, 1, 1), (4, 2, 1), (8, 1, 0)],
+    "tp_size,ep_size,fused_shared,v2",
+    [
+        (2, 1, 1, False),
+        (1, 1, 1, False),
+        (4, 2, 1, False),
+        (8, 1, 0, False),
+        (8, 1, 1, True),
+    ],
 )
 def test_iq2r_glm53_packed_rejects_unsupported_parallelism(
-    tp_size, ep_size, fused_shared
+    tp_size, ep_size, fused_shared, v2
 ):
     method = _glm53_packed_method(tp_size, 0, 2048 // tp_size)
+    method.v2 = v2
     method.moe.moe_parallel_config.ep_size = ep_size
     layer = torch.nn.Module()
     layer.has_bias = False
     layer.num_fused_shared_experts = fused_shared
     with (
-        pytest.raises(NotImplementedError, match="glm53-packed-v1"),
+        pytest.raises(NotImplementedError, match="GLM-5.3 IQ2R layouts"),
         torch.device("meta"),
     ):
         method.create_weights(
@@ -247,6 +255,7 @@ def _glm53_packed_v2_method(tp_size: int, tp_rank: int, intermediate: int):
     method = _glm53_packed_method(tp_size, tp_rank, intermediate)
     method.v2 = True
     method.v2_classes = 4
+    method.num_experts = 256
     return method
 
 
@@ -266,14 +275,14 @@ def test_iq2r_glm53_packed_v2_create_weights_at_tp4(aiter_iq2r):
     layer = _glm53_packed_layer(method)
 
     down = IQ2RMetadata(logical_n=6144, logical_k=512)
-    assert tuple(layer.w13_weight.shape) == (257, iq2r_glm53_gate_bytes(1024))
+    assert tuple(layer.w13_weight.shape) == (256, iq2r_glm53_gate_bytes(1024))
     assert tuple(layer.w13_weight_scale.shape) == (
-        257,
+        256,
         iq2r_glm53_v2_aux_bytes(1024, 6144, 4, gate=True),
     )
-    assert tuple(layer.w2_weight.shape) == (257, down.data_bytes)
+    assert tuple(layer.w2_weight.shape) == (256, down.data_bytes)
     assert tuple(layer.w2_weight_scale.shape) == (
-        257,
+        256,
         iq2r_glm53_v2_aux_bytes(6144, 512, 4, gate=False),
     )
 
@@ -386,3 +395,43 @@ def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(aiter_iq2r, monkeypatch):
     assert calls[0][8] == ("workspace", hidden.device)
     with pytest.raises(ValueError, match="does not support"):
         method.apply(**{**arguments, "activation": moe_mod.ActivationType.Swiglu})
+
+
+def test_iq2r_glm53_packed_v2_apply_passes_top8_routing(aiter_iq2r, monkeypatch):
+    method = _glm53_packed_v2_method(tp_size=8, tp_rank=0, intermediate=256)
+    layer = SimpleNamespace(
+        num_fused_shared_experts=0,
+        routed_scaling_factor=2.5,
+        w13_weight=torch.empty((256, 3), dtype=torch.uint8),
+        w13_weight_scale=torch.empty((256, 5), dtype=torch.uint8),
+        w2_weight=torch.empty((256, 2), dtype=torch.uint8),
+        w2_weight_scale=torch.empty((256, 7), dtype=torch.uint8),
+    )
+    hidden = torch.randn(2, 6144, dtype=torch.bfloat16)
+    topk_weights = torch.full((2, 8), 0.1, dtype=torch.float32)
+    topk_ids = torch.arange(16, dtype=torch.int32).reshape(2, 8)
+    selected, calls = [], []
+
+    def select_experts(**kwargs):
+        selected.append(kwargs)
+        return topk_weights, topk_ids
+
+    monkeypatch.setattr(
+        moe_mod.FusedMoE, "select_experts", staticmethod(select_experts)
+    )
+    monkeypatch.setattr(method, "_glm53_workspace", lambda device: "workspace")
+    monkeypatch.setattr(
+        aiter_iq2r, "iq2r_glm53_moe_out", lambda *args: calls.append(args)
+    )
+    method.apply(
+        layer=layer,
+        x=hidden,
+        router_logits=torch.randn(2, 256),
+        top_k=8,
+        renormalize=True,
+        global_num_experts=256,
+        scoring_func="sigmoid",
+        e_score_correction_bias=torch.randn(256),
+    )
+    assert selected[0]["num_fused_shared_experts"] == 0
+    assert calls[0][5] is topk_weights and calls[0][6] is topk_ids
