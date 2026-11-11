@@ -170,6 +170,7 @@ cannot affect a server that does not use the feature.
 | **ATOM_GLM5_KPOOL** | bool | 1 (true) | Enable the pooled sparse indexer. Setting `0` is an exact token-granular A/B only at or below `index_topk`; longer requests are refused. |
 | **ATOM_GLM5_FORCE_DENSE_MLA** | bool | 0 (false) | Disable sparse MLA for short-context bring-up comparisons. |
 | **ATOM_GLM5_DISABLE_FUSED_MHC** | bool | 0 (false) | Force the PyTorch mHC reference path instead of AITER's fused kernels. |
+| **ATOM_GLM5_MXFP4_FP8_ACT** | bool | 0 (false) | With MXFP4 routed experts (for example online `*expert*: mxfp4`), quantize their activations to MXFP8 instead of FP4 (A8W4 rather than A4W4). Other expert formats ignore it. |
 
 ### Native model decode
 

@@ -576,6 +576,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GLM5_DISABLE_FUSED_MHC": lambda: (
         os.getenv("ATOM_GLM5_DISABLE_FUSED_MHC", "0") == "1"
     ),
+    # Run MXFP4 routed experts on MXFP8 activations (A8W4) instead of FP4 ones.
+    "ATOM_GLM5_MXFP4_FP8_ACT": lambda: (
+        os.getenv("ATOM_GLM5_MXFP4_FP8_ACT", "0") == "1"
+    ),
     # MiniMax-M3 indexer-only context parallelism, as an ops override for
     # dcp_config.indexer_dcp_only. Selection is bit-identical to the TP path, so
     # this is an exact A/B: it trades a per-layer all-to-all for full MMA
