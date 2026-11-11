@@ -457,6 +457,7 @@ class Glm5NextMoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias,
             config=config,
             shared_expert_prefix=f"{prefix}.shared_experts",
+            mxfp4_fp8_activations=envs.ATOM_GLM5_MXFP4_FP8_ACT,
         )
         # GLM clamps gate/up inside the expert SwiGLU; aiter bakes the limit into
         # the GEMM1 kernel when the layer carries this attribute.
