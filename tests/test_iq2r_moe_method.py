@@ -113,7 +113,9 @@ def test_iq2r_glm53_packed_create_weights_at_tp4(aiter_iq2r, entries):
     from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes, iq2r_glm53_v2_aux_bytes
     from aiter.ops.iq2r_format import IQ2RMetadata
 
-    method = _glm53_packed_method(tp_size=4, tp_rank=1, intermediate=512, entries=entries)
+    method = _glm53_packed_method(
+        tp_size=4, tp_rank=1, intermediate=512, entries=entries
+    )
     layer = _glm53_packed_layer(method)
 
     down = IQ2RMetadata(logical_n=6144, logical_k=512, codebook_entries=entries)
@@ -138,7 +140,9 @@ def test_iq2r_glm53_packed_create_weights_at_tp4(aiter_iq2r, entries):
 def test_iq2r_glm53_packed_post_load_checks_codebook_range(
     aiter_iq2r, monkeypatch, load_dummy, entries
 ):
-    method = _glm53_packed_method(tp_size=8, tp_rank=0, intermediate=256, entries=entries)
+    method = _glm53_packed_method(
+        tp_size=8, tp_rank=0, intermediate=256, entries=entries
+    )
     layer = _glm53_packed_layer(method, device="cpu", num_experts=2)
     for aux in (layer.w13_weight_scale, layer.w2_weight_scale):
         aux.data[:, : entries * 8] = 0x38  # E4M3 1.0, inside the kernels' range
@@ -278,9 +282,13 @@ def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(aiter_iq2r, monkeypatch):
     monkeypatch.setattr(
         method, "_glm53_workspace", lambda device: ("workspace", device)
     )
-    monkeypatch.setattr(
-        aiter_iq2r, "iq2r_glm53_moe_out", lambda *args: calls.append(args)
-    )
+    shared_calls = []
+
+    def moe_out(*args, shared=None):
+        calls.append(args)
+        shared_calls.append(shared)
+
+    monkeypatch.setattr(aiter_iq2r, "iq2r_glm53_moe_out", moe_out)
     arguments = {
         "layer": layer,
         "x": hidden,
@@ -302,9 +310,65 @@ def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(aiter_iq2r, monkeypatch):
     assert calls[0][5].shape == calls[0][6].shape == (2, 8)
     assert calls[0][7] is output
     assert calls[0][8] == ("workspace", hidden.device)
+    assert shared_calls == [None]  # no shared expert attached
     with pytest.raises(ValueError, match="does not support"):
         method.apply(**{**arguments, "activation": moe_mod.ActivationType.Swiglu})
     with pytest.raises(ValueError, match="BF16 rows"):
         method.apply(**{**arguments, "x_scale": torch.ones(2, 1)})
     with pytest.raises(ValueError, match="router weights"):
         method.apply(**{**arguments, "apply_router_weight_on_input": True})
+
+
+def test_iq2r_glm53_apply_fuses_the_attached_shared_expert(aiter_iq2r, monkeypatch):
+    """An attached shared expert goes to the IQ2R launches for small batches only."""
+    method = _glm53_packed_method(tp_size=4, tp_rank=0, intermediate=512)
+    layer = SimpleNamespace(
+        num_fused_shared_experts=0,
+        w13_weight=torch.empty((256, 3), dtype=torch.uint8),
+        w13_weight_scale=torch.empty((256, 5), dtype=torch.uint8),
+        w2_weight=torch.empty((256, 2), dtype=torch.uint8),
+        w2_weight_scale=torch.empty((256, 7), dtype=torch.uint8),
+    )
+    generator = torch.Generator().manual_seed(0)
+    gate, up = (torch.randn((512, 6144), generator=generator) * 0.02 for _ in range(2))
+    down = torch.randn((6144, 512), generator=generator) * 0.02
+    method.attach_shared_expert(layer, gate, up, down)
+    packed = layer.iq2r_shared
+    assert packed.gate.numel() == 2 * 512 * 6144 and packed.down.numel() == 512 * 6144
+    assert packed.gate_scales.numel() == 2 * 512 * 192
+    assert packed.down_scales.numel() == 512 * 6144 // 32
+
+    seen = []
+    monkeypatch.setattr(method, "_glm53_workspace", lambda device: None)
+    monkeypatch.setattr(
+        aiter_iq2r, "iq2r_glm53_moe_out", lambda *args, shared=None: seen.append(shared)
+    )
+    limit = method.fused_shared_tokens()
+    assert limit == aiter_iq2r.FUSED_SHARED_TOKENS
+    for tokens in (1, limit, limit + 1):
+        method.apply(
+            layer=layer,
+            x=torch.zeros((tokens, 6144), dtype=torch.bfloat16),
+            topk_weights=torch.zeros((tokens, 8)),
+            topk_ids=torch.zeros((tokens, 8), dtype=torch.int32),
+            global_num_experts=256,
+            activation=moe_mod.ActivationType.Silu,
+        )
+    assert seen == [packed, packed, None]
+
+
+def test_dequantize_linear_block_and_row_scales():
+    from atom.models.deepseek_v2 import _dequantize_linear
+
+    weight = torch.randn((256, 384)).to(torch.float8_e4m3fn)
+    block = torch.rand((2, 3)) + 0.5
+    linear = SimpleNamespace(weight=weight, weight_scale=block)
+    expected = weight.float() * block.repeat_interleave(128, 0).repeat_interleave(
+        128, 1
+    )
+    assert torch.equal(_dequantize_linear(linear), expected)
+    rows = torch.rand((256, 1))
+    linear = SimpleNamespace(weight=weight, weight_scale=rows)
+    assert torch.equal(_dequantize_linear(linear), weight.float() * rows)
+    linear = SimpleNamespace(weight=weight.float())
+    assert torch.equal(_dequantize_linear(linear), weight.float())

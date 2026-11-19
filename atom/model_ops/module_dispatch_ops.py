@@ -70,6 +70,9 @@ def maybe_dual_stream_forward(
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
+    # IQ2R MoE with the shared expert fused into its launches (DeepseekV2MoE).
+    if 0 < hidden_states.shape[0] <= getattr(self, "_iq2r_fused_shared_tokens", 0):
+        return self.iq2r_fused_moe_forward(hidden_states)
     if _dual_stream_is_active(self, hidden_states.shape[0]):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)

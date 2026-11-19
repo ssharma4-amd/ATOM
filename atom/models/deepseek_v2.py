@@ -24,6 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
+import os
 from typing import ClassVar
 
 import torch
@@ -1221,6 +1222,36 @@ class DeepseekV2MoE(nn.Module):
         )
         return final_hidden_states.view(num_tokens, hidden_dim)
 
+    def process_weights_after_loading(self) -> None:
+        """IQ2R experts: run the shared expert inside the IQ2R launches for
+        batches the fused kernels cover (ATOM_IQ2R_FUSE_SHARED=0 keeps it a
+        separate MLP). Parents are processed before their children, so the
+        shared expert still holds its checkpoint FP8 weights here."""
+        from atom.model_ops.moe import Iq2rMoEMethod
+
+        method = getattr(self.experts, "quant_method", None)
+        self._iq2r_fused_shared_tokens = 0
+        if (
+            not isinstance(method, Iq2rMoEMethod)
+            or self.n_shared_experts is None
+            or self.is_rocm_aiter_fusion_shared_expert_enabled
+            or not self._use_dual_stream
+            or os.environ.get("ATOM_IQ2R_FUSE_SHARED", "1") == "0"
+            or get_current_atom_config().load_dummy
+        ):
+            return
+        gate_up = _dequantize_linear(self.shared_experts.gate_up_proj)
+        down = _dequantize_linear(self.shared_experts.down_proj)
+        gate, up = gate_up.chunk(2, dim=0)
+        method.attach_shared_expert(self.experts, gate, up, down)
+        self._iq2r_fused_shared_tokens = method.fused_shared_tokens()
+
+    def iq2r_fused_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The IQ2R launches add the shared expert (Iq2rMoEMethod.apply).
+        return self.combine_outputs(
+            self.routed_expert_forward(hidden_states), None, hidden_states
+        )
+
     def single_stream_moe_forward(
         self,
         hidden_states: torch.Tensor,
@@ -1251,6 +1282,22 @@ class DeepseekV2MoE(nn.Module):
 
         # Non-dual-stream path: shared experts + routed experts sequentially
         return self.single_stream_moe_forward(hidden_states)
+
+
+def _dequantize_linear(linear: nn.Module) -> torch.Tensor:
+    """FP32 weight [out, in] of a checkpoint-format linear: BF16, or FP8 with a
+    per-row or per-block (``weight_scale`` [ceil(out/b), ceil(in/b)]) scale."""
+    weight = linear.weight.float()
+    scale = getattr(linear, "weight_scale", None)
+    if scale is None:
+        return weight
+    scale = scale.float()
+    if scale.dim() == 1 or scale.shape[1] == 1:
+        return weight * scale.reshape(-1, 1)
+    rows = -(-weight.shape[0] // scale.shape[0])
+    columns = -(-weight.shape[1] // scale.shape[1])
+    expanded = scale.repeat_interleave(rows, 0).repeat_interleave(columns, 1)
+    return weight * expanded[: weight.shape[0], : weight.shape[1]]
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
