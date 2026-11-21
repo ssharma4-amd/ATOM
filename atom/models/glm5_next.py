@@ -65,6 +65,11 @@ from aiter.dist.parallel_state import (
 from torch import nn
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
+
+# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
+# through which Glm5NextMoE runs IQ2R experts (the per-call row test of the
+# fused shared expert stays out of the traced graph).
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -79,7 +84,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
     mxfp4_k_pad_align,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, Iq2rMoEMethod
 from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn
 from atom.model_ops.swiglu_oai import swiglu_oai_split
@@ -88,7 +93,7 @@ from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled,
 )
 from atom.model_ops.utils import atom_parameter
-from atom.models.deepseek_v2 import Indexer
+from atom.models.deepseek_v2 import Indexer, _dequant_fp8_block
 from atom.models.kimi_k3 import (
     KimiKDAAttention,
     _text_config,
@@ -462,13 +467,66 @@ class Glm5NextMoE(nn.Module):
         # the GEMM1 kernel when the layer carries this attribute.
         self.experts.swiglu_limit = self.swiglu_limit
 
+        # IQ2R experts may run the shared expert inside their launches
+        # (`process_weights_after_loading`); `maybe_dual_stream_forward` then
+        # picks the fused or the single-stream path per call, out of the traced
+        # graph (module_dispatch_ops caller contract; no dual stream here).
+        # Fixed by the quant config alone, so the traced graph does not depend
+        # on ATOM_IQ2R_FUSE_SHARED.
+        self.prefix = prefix
+        self._use_dual_stream = False
+        self._dual_stream_token_threshold = 0
+        self._dual_stream_decode_token_threshold = 0
+        # Rows up to which `fused_moe_forward` runs; set after loading, 0 = never.
+        self.fused_moe_forward_rows = 0
+        self._iq2r_shared_fusable = (
+            isinstance(self.experts.quant_method, Iq2rMoEMethod)
+            and self.shared_experts is not None
+        )
+        if self._iq2r_shared_fusable:
+            compilation_config = get_current_atom_config().compilation_config
+            compilation_config.static_forward_context[prefix] = self
+
+    def process_weights_after_loading(self) -> None:
+        """IQ2R experts: run the shared expert inside the IQ2R launches for
+        batches the fused kernels cover (``ATOM_IQ2R_FUSE_SHARED=0`` keeps it a
+        separate MLP). ``load_model`` walks ``model.named_modules()`` parent
+        first, so the shared expert's linears still hold their checkpoint
+        block-FP8 weights and scales here."""
+        if (
+            not self._iq2r_shared_fusable
+            or not envs.ATOM_IQ2R_FUSE_SHARED
+            or get_current_atom_config().load_dummy
+        ):
+            return
+        gate_up_proj = self.shared_experts.gate_up_proj
+        down_proj = self.shared_experts.down_proj
+        gate, up = _dequant_fp8_block(
+            gate_up_proj.weight, gate_up_proj.weight_scale
+        ).chunk(2, dim=0)
+        down = _dequant_fp8_block(down_proj.weight, down_proj.weight_scale)
+        method = self.experts.quant_method
+        method.attach_shared_expert(self.experts, gate, up, down)
+        self.fused_moe_forward_rows = method.fused_shared_tokens()
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._iq2r_shared_fusable:
+            return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
+        return self.single_stream_moe_forward(hidden_states)
+
+    def fused_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The IQ2R launches add the shared expert (Iq2rMoEMethod.apply).
+        return self.single_stream_moe_forward(hidden_states, shared=False)
+
+    def single_stream_moe_forward(
+        self, hidden_states: torch.Tensor, shared: bool = True
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         router_logits = self.gate(hidden_states.to(dtype=torch.float32))
         shared_output = None
-        if self.shared_experts is not None:
+        if shared and self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
 
         out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
@@ -1172,6 +1230,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
     # consuming VRAM with unreachable randomly-risky code.
     weights_mapping: ClassVar[dict[str, str]] = {
         "model.language_model.": "model.",
+        # IQ2R checkpoints (glm5next-packed-v2/-v3) store each layer's routed
+        # experts as one stacked gate/up and down matrix; the shared expert
+        # and the MTP layer keep their FP8 checkpoint weights.
+        ".mlp.up_gate_proj.0.iq2r_data": ".mlp.experts.w13_weight",
+        ".mlp.up_gate_proj.0.iq2r_auxiliary": ".mlp.experts.w13_weight_scale",
+        ".mlp.down_proj.0.iq2r_data": ".mlp.experts.w2_weight",
+        ".mlp.down_proj.0.iq2r_auxiliary": ".mlp.experts.w2_weight_scale",
+        ".mlp.up_gate_proj.0.iq2r_tN": ".mlp.experts.w13_iq2r_tile_n",
+        ".mlp.down_proj.0.iq2r_tN": ".mlp.experts.w2_iq2r_tile_n",
         # The checkpoint stores this projection as a bare matrix parameter.
         "index_kpool_compress_gate": "index_kpool_compress_gate.weight",
     }

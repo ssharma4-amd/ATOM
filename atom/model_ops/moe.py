@@ -917,25 +917,34 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         )
 
 
-# One GLM-5.3 IQ2R workspace per device and shape, shared by every MoE layer:
+# One GLM-5 IQ2R workspace per device and shape, shared by every MoE layer:
 # layers run serially on a rank, so a fixed buffer set is also graph-safe.
-_IQ2R_GLM53_WORKSPACES: dict[tuple[torch.device, int, int], object] = {}
+_IQ2R_GLM53_WORKSPACES: dict[tuple, object] = {}
 # The kernels' N tile; checkpoints record theirs as `iq2r_tN`.
 _IQ2R_GLM53_TILE_N = 128
-# Codebook entries of each packed GLM-5.3 IQ2R-v2 layout: v3 is the
-# 1,024-entry (10-bit index) variant of the same format.
-_IQ2R_GLM53_LAYOUTS = {"glm53-packed-v2": 512, "glm53-packed-v3": 1024}
+# Each packed GLM-5 IQ2R-v2 layout: the aiter.iq2r_glm53 model shape and the
+# codebook entries (v3 is the 1,024-entry, 10-bit index variant of the same
+# format).
+_IQ2R_GLM53_LAYOUTS = {
+    "glm53-packed-v2": ("GLM53", 512),
+    "glm53-packed-v3": ("GLM53", 1024),
+    "glm5next-packed-v2": ("GLM5_NEXT", 512),
+    "glm5next-packed-v3": ("GLM5_NEXT", 1024),
+}
 
 
 class Iq2rMoEMethod(FusedMoEMethodBase):
-    """AITER IQ2R-v2 experts in the ``glm53-packed-v2`` (512-entry codebooks)
-    or ``glm53-packed-v3`` (1,024-entry) layout.
+    """AITER IQ2R-v2 experts in a packed GLM-5 layout: ``glm53-packed-v2``
+    (512-entry codebooks) or ``glm53-packed-v3`` (1,024-entry) for GLM-5.3's
+    256 routed experts (hidden 6144), ``glm5next-packed-v2``/``-v3`` for
+    GLM-5.3-Flash's 288 (hidden 4096, clamped SwiGLU, down rows padded to
+    4608).
 
-    The layouts cover GLM-5.3's 256 routed experts at TP4/TP8. The shared
-    expert is stored block-FP8 and loaded as an ordinary MLP outside the MoE;
-    for small batches (decode) it runs inside the IQ2R launches instead, as
-    MXFP8 (``attach_shared_expert``). The checkpoint holds full layers; each
-    rank slices its share of the intermediate dimension as it loads.
+    Every layout runs at TP4/TP8. The shared expert is stored block-FP8 and
+    loaded as an ordinary MLP outside the MoE; for small batches (decode) it
+    runs inside the IQ2R launches instead, as MXFP8 (``attach_shared_expert``).
+    The checkpoint holds full layers; each rank slices its share of the
+    intermediate dimension as it loads.
     """
 
     def __init__(
@@ -952,7 +961,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
                 f"{sorted(_IQ2R_GLM53_LAYOUTS)} checkpoints"
             )
         self.layout = layout
-        self.codebook_entries = _IQ2R_GLM53_LAYOUTS[layout]
+        self.shape_name, self.codebook_entries = _IQ2R_GLM53_LAYOUTS[layout]
 
     def create_weights(
         self,
@@ -980,30 +989,39 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         self.tp_size = parallel.tp_size
         self.tp_rank = parallel.tp_rank
 
+        import aiter.iq2r_glm53 as glm53
         from aiter.iq2r_glm53 import iq2r_glm53_aux_bytes, iq2r_glm53_gate_bytes
         from aiter.ops.iq2r_format import IQ2RMetadata
         from aiter.ops.iq2r_v2 import IQ2R_V2_LEVELS_C4
 
+        shape = getattr(glm53, self.shape_name)
+        if (hidden_size, num_experts) != (shape.hidden, shape.experts):
+            raise ValueError(
+                f"the {self.layout} IQ2R layout is for hidden {shape.hidden} and "
+                f"{shape.experts} experts, not {hidden_size} and {num_experts}"
+            )
+        self.shape = shape
         # IQ2R-v2 auxiliaries hold the codebook copies, a d table and the
-        # output gains (aiter/ops/iq2r_v2.py).
+        # output gains (aiter/ops/iq2r_v2.py). The down rows are padded to
+        # shape.down_rows (equal to hidden for GLM-5.3).
         self.classes = IQ2R_V2_LEVELS_C4.classes
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size_per_partition
         gate_n = 2 * intermediate_size_per_partition
         entries = self.codebook_entries
         down_metadata = IQ2RMetadata(
-            logical_n=hidden_size,
+            logical_n=shape.down_rows,
             logical_k=intermediate_size_per_partition,
             codebook_entries=entries,
         )
         shapes = {
-            "w13_weight": iq2r_glm53_gate_bytes(gate_n, entries),
+            "w13_weight": iq2r_glm53_gate_bytes(gate_n, entries, shape),
             "w13_weight_scale": iq2r_glm53_aux_bytes(
                 gate_n, hidden_size, self.classes, gate=True, codebook_entries=entries
             ),
             "w2_weight": down_metadata.data_bytes,
             "w2_weight_scale": iq2r_glm53_aux_bytes(
-                hidden_size,
+                shape.down_rows,
                 intermediate_size_per_partition,
                 self.classes,
                 gate=False,
@@ -1058,7 +1076,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         entries = self.codebook_entries
         if name == "w13_weight":
             return iq2r_glm53_slice_gate(
-                weight, 2 * shard * self.tp_rank, 2 * shard, entries
+                weight, 2 * shard * self.tp_rank, 2 * shard, entries, self.shape
             )
         if name == "w13_weight_scale":
             return iq2r_glm53_slice_gate_aux(
@@ -1073,19 +1091,29 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             return iq2r_slice_input_data(
                 weight,
                 IQ2RMetadata(
-                    logical_n=self.hidden_size, logical_k=full, codebook_entries=entries
+                    logical_n=self.shape.down_rows,
+                    logical_k=full,
+                    codebook_entries=entries,
                 ),
                 shard * self.tp_rank,
                 shard,
             )
         # The d table runs along the down input, so it shards like the data.
         return iq2r_glm53_slice_down_aux(
-            weight, shard * self.tp_rank, shard, full, self.classes, entries
+            weight, shard * self.tp_rank, shard, full, self.classes, entries, self.shape
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from aiter.ops.iq2r_v2 import iq2r_v2_check_codebook
 
+        # The kernels build the model's SwiGLU in: GLM-5.3-Flash's clamp at
+        # its swiglu_limit, none for GLM-5.3.
+        limit = getattr(layer, "swiglu_limit", None)
+        if limit != self.shape.swiglu_limit:
+            raise ValueError(
+                f"the {self.layout} IQ2R kernels clamp the SwiGLU at "
+                f"{self.shape.swiglu_limit}, but the model's limit is {limit}"
+            )
         # load_weight checked every shape. Most kernels form codebook copies
         # 1-3 from copy 0 (the first entries x 8 bytes), exact only for bytes
         # 0x08..0x78; `--load_dummy` writes no codebooks.
@@ -1098,11 +1126,14 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     def _glm53_workspace(self, device: torch.device):
         from aiter.iq2r_glm53 import IQ2RGlm53Workspace
 
-        key = (device, self.moe.max_num_tokens, self.intermediate_size)
+        key = (device, self.moe.max_num_tokens, self.intermediate_size, self.shape)
         workspace = _IQ2R_GLM53_WORKSPACES.get(key)
         if workspace is None:
             workspace = IQ2RGlm53Workspace.allocate(
-                self.moe.max_num_tokens, self.intermediate_size, device=device
+                self.moe.max_num_tokens,
+                self.intermediate_size,
+                device=device,
+                shape=self.shape,
             )
             _IQ2R_GLM53_WORKSPACES[key] = workspace
         return workspace
@@ -1131,7 +1162,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         of at most :meth:`fused_shared_tokens` tokens."""
         from aiter.iq2r_glm53 import iq2r_glm53_pack_shared
 
-        layer.iq2r_shared = iq2r_glm53_pack_shared(gate, up, down)
+        layer.iq2r_shared = iq2r_glm53_pack_shared(gate, up, down, self.shape)
 
     @mark_trace(prefix="iq2r_moe", torch_compile=False)
     def apply(
