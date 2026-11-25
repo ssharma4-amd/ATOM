@@ -928,11 +928,13 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     GLM-5.3-Flash's 288 (hidden 4096, clamped SwiGLU, down rows padded to
     4608).
 
-    Every layout runs at TP4/TP8. The shared expert is stored block-FP8 and
-    loaded as an ordinary MLP outside the MoE; for small batches (decode) it
-    runs inside the IQ2R launches instead, as MXFP8 (``attach_shared_expert``).
-    The checkpoint holds full layers; each rank slices its share of the
-    intermediate dimension as it loads.
+    Every layout runs at TP1, TP2, TP4 and TP8. The kernels run 512- or
+    256-wide (TP4/TP8) shards; a wider rank holds its experts as stacked
+    512-wide shards [shards, experts, bytes] (``aiter.iq2r_glm53``). The shared
+    expert is stored block-FP8 and loaded as an ordinary MLP outside the MoE;
+    for small batches (decode) it runs inside the IQ2R launches instead, as
+    MXFP8 (``attach_shared_expert``). The checkpoint holds full layers; each
+    rank slices its share of the intermediate dimension as it loads.
     """
 
     def __init__(
@@ -962,24 +964,30 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     ) -> None:
         # The layout fixes the model shapes and load_weight checks every
         # buffer against them, so only the parallel setup is checked here.
+        import aiter.iq2r_glm53 as glm53
+        from aiter.iq2r_glm53 import (
+            RANK_INTERMEDIATE_SIZES,
+            iq2r_glm53_gate_bytes,
+            iq2r_glm53_shards,
+            iq2r_glm53_v2_aux_bytes,
+        )
+        from aiter.ops.iq2r_format import IQ2RMetadata
+        from aiter.ops.iq2r_v2 import IQ2R_V2_LEVELS_C4
+
         parallel = self.moe.moe_parallel_config
         if (
-            parallel.tp_size not in (4, 8)
+            intermediate_size_per_partition not in RANK_INTERMEDIATE_SIZES
             or parallel.ep_size != 1
             or layer.has_bias
             or layer.num_fused_shared_experts != 0
         ):
             raise NotImplementedError(
-                f"the {self.layout} IQ2R layout runs at TP4/TP8 without EP, "
-                "with the shared expert outside the MoE"
+                f"the {self.layout} IQ2R layout runs ranks of intermediate "
+                f"{RANK_INTERMEDIATE_SIZES} (TP1/TP2/TP4/TP8) without EP, with "
+                "the shared expert outside the MoE"
             )
         self.tp_size = parallel.tp_size
         self.tp_rank = parallel.tp_rank
-
-        import aiter.iq2r_glm53 as glm53
-        from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes, iq2r_glm53_v2_aux_bytes
-        from aiter.ops.iq2r_format import IQ2RMetadata
-        from aiter.ops.iq2r_v2 import IQ2R_V2_LEVELS_C4
 
         shape = getattr(glm53, self.shape_name)
         if (hidden_size, num_experts) != (shape.hidden, shape.experts):
@@ -994,11 +1002,14 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         self.classes = IQ2R_V2_LEVELS_C4.classes
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size_per_partition
-        gate_n = 2 * intermediate_size_per_partition
+        # A rank wider than the kernels stacks its 512-wide shards.
+        self.shards = iq2r_glm53_shards(intermediate_size_per_partition)
+        width = intermediate_size_per_partition // self.shards
+        gate_n = 2 * width
         entries = self.codebook_entries
         down_metadata = IQ2RMetadata(
             logical_n=shape.down_rows,
-            logical_k=intermediate_size_per_partition,
+            logical_k=width,
             codebook_entries=entries,
         )
         shapes = {
@@ -1009,14 +1020,15 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             "w2_weight": down_metadata.data_bytes,
             "w2_weight_scale": iq2r_glm53_v2_aux_bytes(
                 shape.down_rows,
-                intermediate_size_per_partition,
+                width,
                 self.classes,
                 gate=False,
                 codebook_entries=entries,
             ),
         }
+        stack = (self.shards,) if self.shards > 1 else ()
         tensors = {
-            name: torch.empty((num_experts, nbytes), dtype=torch.uint8)
+            name: torch.empty((*stack, num_experts, nbytes), dtype=torch.uint8)
             for name, nbytes in shapes.items()
         }
         # The compiler also records the N tile it packed each projection for.
@@ -1040,7 +1052,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
                     f"IQ2R {name} is {loaded_weight.tolist()}, but the "
                     f"{self.layout} kernels need {_IQ2R_GLM53_TILE_N}"
                 )
-        elif self.tp_size > 1:
+        elif self.tp_size > 1 or self.shards > 1:
             loaded_weight = self._glm53_tp_slice(name, loaded_weight)
         if tuple(param.shape) != tuple(loaded_weight.shape):
             raise ValueError(
@@ -1050,44 +1062,26 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         param.data.copy_(loaded_weight)
 
     def _glm53_tp_slice(self, name: str, weight: torch.Tensor) -> torch.Tensor:
-        """This rank's intermediate-dimension shard of a full packed layer."""
-        from aiter.iq2r_glm53 import (
-            iq2r_glm53_slice_gate,
-            iq2r_glm53_v2_slice_down_aux,
-            iq2r_glm53_v2_slice_gate_aux,
-        )
-        from aiter.ops.iq2r_format import IQ2RMetadata, iq2r_slice_input_data
+        """This rank's intermediate-dimension shard of a full packed layer,
+        as stacked 512-wide kernel shards for a rank wider than 512."""
+        from aiter.iq2r_glm53 import iq2r_glm53_slice_layer
 
-        shard = self.intermediate_size
-        full = shard * self.tp_size
-        entries = self.codebook_entries
-        if name == "w13_weight":
-            return iq2r_glm53_slice_gate(
-                weight, 2 * shard * self.tp_rank, 2 * shard, entries, self.shape
-            )
-        if name == "w13_weight_scale":
-            return iq2r_glm53_v2_slice_gate_aux(
-                weight,
-                2 * shard * self.tp_rank,
-                2 * shard,
-                2 * full,
-                self.classes,
-                entries,
-            )
-        if name == "w2_weight":
-            return iq2r_slice_input_data(
-                weight,
-                IQ2RMetadata(
-                    logical_n=self.shape.down_rows,
-                    logical_k=full,
-                    codebook_entries=entries,
-                ),
-                shard * self.tp_rank,
-                shard,
-            )
-        # The d table runs along the down input, so it shards like the data.
-        return iq2r_glm53_v2_slice_down_aux(
-            weight, shard * self.tp_rank, shard, full, self.classes, entries, self.shape
+        width = self.intermediate_size
+        stacks = {
+            "w13_weight": "gate",
+            "w13_weight_scale": "gate_aux",
+            "w2_weight": "down",
+            "w2_weight_scale": "down_aux",
+        }
+        return iq2r_glm53_slice_layer(
+            stacks[name],
+            weight,
+            width * self.tp_rank,
+            width,
+            width * self.tp_size,
+            self.codebook_entries,
+            self.shape,
+            self.classes,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -1107,7 +1101,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         if not get_current_atom_config().load_dummy:
             book_bytes = self.codebook_entries * 8
             for aux in (layer.w13_weight_scale, layer.w2_weight_scale):
-                iq2r_v2_check_codebook(aux[:, :book_bytes].view(torch.float8_e4m3fn))
+                iq2r_v2_check_codebook(aux[..., :book_bytes].view(torch.float8_e4m3fn))
         self._glm53_workspace(layer.w13_weight.device)
 
     def _glm53_workspace(self, device: torch.device):

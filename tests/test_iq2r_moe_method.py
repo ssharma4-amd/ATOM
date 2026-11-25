@@ -40,6 +40,7 @@ def aiter_iq2r():
 def test_iq2r_weight_loader_requires_exact_shapes():
     method = object.__new__(moe_mod.Iq2rMoEMethod)
     method.tp_size = 1
+    method.shards = 1
     parameter = torch.nn.Parameter(
         torch.empty((2, 8), dtype=torch.uint8), requires_grad=False
     )
@@ -111,6 +112,7 @@ def _glm53_packed_method(
     method.classes = 4
     method.hidden_size = hidden
     method.intermediate_size = intermediate
+    method.shards = max(intermediate // 512, 1)
     method.tp_size = tp_size
     method.tp_rank = tp_rank
     return method
@@ -176,6 +178,23 @@ def test_iq2r_glm53_packed_create_weights_at_tp4(aiter_iq2r, entries, model):
         parameter = getattr(layer, name)
         assert (tuple(parameter.shape), parameter.dtype) == ((1,), torch.int32)
     assert (method.tp_size, method.tp_rank, method.classes) == (4, 1, 4)
+
+
+@pytest.mark.parametrize("model", sorted(_MODELS))
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_iq2r_glm53_packed_create_weights_stacks_wide_ranks(aiter_iq2r, tp_size, model):
+    """A rank wider than the kernels (TP1: 2048, TP2: 1024) stacks its
+    512-wide shards, each the size of a TP4 rank's stack."""
+    tp4 = _glm53_packed_layer(_glm53_packed_method(4, 0, 512, 1024, model))
+    method = _glm53_packed_method(tp_size, 0, 2048 // tp_size, 1024, model)
+    layer = _glm53_packed_layer(method)
+    shards = 4 // tp_size
+    assert method.shards == shards
+    for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+        assert tuple(getattr(layer, name).shape) == (
+            shards,
+            *getattr(tp4, name).shape,
+        ), name
 
 
 @pytest.mark.parametrize("model", sorted(_MODELS))
@@ -287,7 +306,7 @@ def test_glm53_weights_mapping_targets_every_compiled_tensor(aiter_iq2r):
 
 @pytest.mark.parametrize(
     "tp_size,ep_size,fused_shared",
-    [(2, 1, 0), (1, 1, 0), (4, 2, 0), (8, 1, 1)],
+    [(16, 1, 0), (4, 2, 0), (1, 2, 0), (8, 1, 1)],
 )
 def test_iq2r_glm53_packed_rejects_unsupported_parallelism(
     tp_size, ep_size, fused_shared
@@ -312,7 +331,7 @@ def test_iq2r_glm53_packed_rejects_unsupported_parallelism(
 
 @pytest.mark.parametrize("model", sorted(_MODELS))
 @pytest.mark.parametrize("entries", [512, 1024])
-@pytest.mark.parametrize("tp_size,tp_rank", [(4, 3), (8, 5)])
+@pytest.mark.parametrize("tp_size,tp_rank", [(4, 3), (8, 5), (2, 1), (1, 0)])
 def test_iq2r_glm53_packed_loader_slices_the_rank_shard(
     aiter_iq2r, tp_size, tp_rank, entries, model
 ):
@@ -365,6 +384,17 @@ def test_iq2r_glm53_packed_loader_slices_the_rank_shard(
     assert expected["w13_weight"].shape[1] == iq2r_glm53_gate_bytes(
         2 * shard, entries, shape
     )
+    if shard > 512:
+        # A wide rank loads stacked 512-wide shards: those of TP4 ranks
+        # tp_rank * shards .. + shards - 1.
+        tp4 = _glm53_packed_method(4, 0, 512, entries, model)
+        expected = {}
+        for name in weights:
+            parts = []
+            for rank in range(tp_rank * shard // 512, (tp_rank + 1) * shard // 512):
+                tp4.tp_rank = rank
+                parts.append(tp4._glm53_tp_slice(name, weights[name]))
+            expected[name] = torch.stack(parts)
     for name, value in expected.items():
         parameter = torch.nn.Parameter(torch.empty_like(value), requires_grad=False)
         parameter.iq2r_name = name
